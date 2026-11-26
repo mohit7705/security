@@ -13,6 +13,7 @@ from security_analyzer.core.exceptions import SecurityAnalyzerError
 from security_analyzer.core.stage_registry import STAGE_DEFINITIONS
 from security_analyzer.core.workspace import WorkspaceManager
 from security_analyzer.main import execute_scan, load_settings, resume_scan, run_doctor
+from security_analyzer.ui.runner import print_tui_summary, resolve_ui_mode, run_scan_with_ui
 from security_analyzer.utils.redaction import scrub_text
 
 
@@ -66,6 +67,12 @@ def _add_scan_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="BASELINE_SCAN_ID",
         help="Prior scan ID to diff new subdomains, endpoints, ports, and findings against",
+    )
+    parser.add_argument(
+        "--ui",
+        choices=["auto", "tui", "plain", "off"],
+        default=None,
+        help="Progress display: auto, tui, plain, or off. Env: QUIVER_UI",
     )
 
 
@@ -159,6 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_p.add_argument("--settings", type=Path, default=Path("config/settings.yaml"))
     resume_p.add_argument("--auth-profiles", type=Path, default=None)
     resume_p.add_argument("--output-root", default=None)
+    resume_p.add_argument("--ui", choices=["auto", "tui", "plain", "off"], default=None)
     resume_p.add_argument(
         "--baseline",
         default=None,
@@ -472,29 +480,47 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report["ready"] else 1
 
         if args.command in {"scan", "attack"}:
-            code, state = execute_scan(
+            ui_mode = resolve_ui_mode(args.ui)
+            code, state = run_scan_with_ui(
+                mode=ui_mode,
                 target=args.target,
-                scope_path=args.scope,
-                settings_path=args.settings,
-                auth_profiles_path=args.auth_profiles,
-                output_root=args.output_root,
-                baseline_scan_id=args.baseline,
+                start=lambda on_ready: execute_scan(
+                    target=args.target,
+                    scope_path=args.scope,
+                    settings_path=args.settings,
+                    auth_profiles_path=args.auth_profiles,
+                    output_root=args.output_root,
+                    baseline_scan_id=args.baseline,
+                    on_ready=on_ready,
+                ),
             )
-            print(json.dumps(state, indent=2, sort_keys=True))
+            if ui_mode == "tui":
+                print_tui_summary(state, code, args.output_root)
+            else:
+                print(json.dumps(state, indent=2, sort_keys=True))
             return code
 
         if args.command == "resume":
             requested_stages = set(args.stage) if args.stage else None
-            code, state = resume_scan(
-                scan_id=args.scan_id,
-                scope_path=args.scope,
-                settings_path=args.settings,
-                auth_profiles_path=args.auth_profiles,
-                only_stages=requested_stages,
-                output_root=args.output_root,
-                baseline_scan_id=args.baseline,
+            ui_mode = resolve_ui_mode(args.ui)
+            code, state = run_scan_with_ui(
+                mode=ui_mode,
+                target=args.scan_id,
+                start=lambda on_ready: resume_scan(
+                    scan_id=args.scan_id,
+                    scope_path=args.scope,
+                    settings_path=args.settings,
+                    auth_profiles_path=args.auth_profiles,
+                    only_stages=requested_stages,
+                    output_root=args.output_root,
+                    baseline_scan_id=args.baseline,
+                    on_ready=on_ready,
+                ),
             )
-            print(json.dumps(state, indent=2, sort_keys=True))
+            if ui_mode == "tui":
+                print_tui_summary(state, code, args.output_root)
+            else:
+                print(json.dumps(state, indent=2, sort_keys=True))
             return code
 
         if args.command == "status":

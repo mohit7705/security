@@ -1,3 +1,4 @@
+
 # syntax=docker/dockerfile:1
 
 FROM python:3.11-slim-bookworm AS builder
@@ -22,7 +23,7 @@ ARG FFUF_VERSION=2.1.0
 ARG GAU_VERSION=2.2.4
 ARG FEROXBUSTER_VERSION=2.11.0
 ARG AMASS_VERSION=4.2.0
-ARG TESTSSL_VERSION=3.2rc3
+ARG TESTSSL_VERSION=v3.2.5
 ARG ASSETFINDER_VERSION=v0.1.1
 ARG WAYBACKURLS_VERSION=v0.1.0
 
@@ -69,11 +70,13 @@ RUN set -eux; \
     GOBIN=/usr/local/bin go install "github.com/tomnomnom/waybackurls@${WAYBACKURLS_VERSION}"; \
     rm -rf /root/go /root/.cache/go-build
 
-# Install testssl.sh into /opt/testssl.
+# Install pinned testssl.sh release.
 RUN set -eux; \
-    git clone --depth 1 --branch "${TESTSSL_VERSION}" https://github.com/drwetter/testssl.sh.git /opt/testssl; \
+    git clone --depth 1 --branch "${TESTSSL_VERSION}" \
+      https://github.com/testssl/testssl.sh.git /opt/testssl; \
+    test -f /opt/testssl/testssl.sh; \
     rm -rf /opt/testssl/.git; \
-    chmod +x /opt/testssl/testssl.sh
+    chmod 0755 /opt/testssl/testssl.sh
 
 # Install BBOT in an isolated venv so its dependencies never conflict with security-analyzer.
 RUN python -m venv /opt/bbot-venv && \
@@ -91,10 +94,10 @@ COPY config/ ./config/
 ARG INSTALL_BROWSER=false
 RUN pip install --no-cache-dir --upgrade pip && \
     if [ "${INSTALL_BROWSER}" = "true" ]; then \
-      pip install --no-cache-dir ".[browser]" && \
+      pip install --no-cache-dir ".[browser,ui]" && \
       PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python -m playwright install chromium; \
     else \
-      pip install --no-cache-dir .; \
+      pip install --no-cache-dir ".[ui]"; \
     fi
 
 
@@ -107,6 +110,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH="/opt/ms-playwright"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
     ca-certificates \
     dnsutils \
     whois \

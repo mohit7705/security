@@ -349,6 +349,18 @@ Conservative defaults for timeouts, request budgets, process limits, browser cap
 | `deep_checks.allow_state_changing_probes` | `false` | Keeps deep checks read-only |
 | `ai_triage.enabled` | `false` | Advisory AI, opt-in |
 
+### Better directory discovery (wordlist)
+
+Quiver ships with a small built-in path list. Build the recommended list from SecLists:
+
+```bash
+make wordlists        # writes config/wordlists/quiver-directories.txt
+```
+
+`config/settings.yaml` points to this file. Quiver reads it from the top and stops at `limits.max_directory_words`
+(default 4000, maximum 10000), so sensitive files, API routes and common paths are tried first. Raise
+`limits.max_directory_words` and `timeouts.directory_scan_sec` together for a deeper scan.
+
 ### 3. Authenticated testing (optional)
 
 ```bash
@@ -359,6 +371,14 @@ export USER_A_TOKEN="…"; export USER_B_TOKEN="…"
 Use separate test accounts with **known owned resource IDs** so IDOR conclusions are evidence-based. Pass `--auth-profiles config/auth_profiles.yaml` to `scan`.
 
 > Never commit `.env`, `config/auth_profiles.yaml`, tokens, cookies, `secrets/` or `output/`.
+
+### Live progress view
+
+Scans show numbered progress lines on stderr when run without an interactive terminal. In a terminal,
+Quiver uses the optional Textual screen with expandable stages, artifact sizes and record counts, and
+redacted output previews. Use `--ui auto|tui|plain|off` or set `QUIVER_UI` to choose a mode. Press `e`
+to expand all stages, `c` to collapse them, or `q` to request a safe stop. Install the optional UI with
+`pip install -e ".[ui]"` when using Python; Docker images include it.
 
 ---
 

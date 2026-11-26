@@ -133,7 +133,26 @@ class PipelineOrchestrator:
         self._runners: dict[str, StageRunner] = {}
         self._started: dict[str, tuple[str, float]] = {}
         self._cancelled = False
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
         self.state = self._load_or_init_state()
+
+    def add_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        """Subscribe to progress events; listener errors never stop a scan."""
+        self._listeners.append(listener)
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        event.setdefault("scan_id", self.workspace.scan_id)
+        event.setdefault("scan_dir", str(self.workspace.scan_dir))
+        for listener in list(self._listeners):
+            try:
+                listener(dict(event))
+            except Exception:
+                pass
+
+    def cancel(self) -> None:
+        """Request that running work stops at its next safe cancellation point."""
+        self._cancelled = True
+        self.resource_governor.cancel()
 
     def register_runner(self, stage_id: str, runner: StageRunner) -> None:
         if stage_id not in self.definitions:
@@ -442,9 +461,26 @@ class PipelineOrchestrator:
         resume: bool = False,
         only_stages: set[str] | None = None,
     ) -> StageStatus:
-        self._cancelled = False
         self.state.pop("cancelled", None)
         selected_stages = self._expand_stage_selection(only_stages)
+        if self._listeners:
+            stage_items = []
+            for stage_id in self.ordered_ids:
+                if selected_stages is not None and stage_id not in selected_stages:
+                    continue
+                definition = self.definitions[stage_id]
+                known = self.state["stages"].get(stage_id, {})
+                stage_items.append({
+                    "stage_id": stage_id,
+                    "title": definition.title,
+                    "phase": definition.phase,
+                    "status": known.get("status", "PENDING"),
+                    "summary": known.get("summary", ""),
+                    "error": known.get("error", ""),
+                    "artifacts": list(known.get("artifacts", [])),
+                    "duration_sec": known.get("duration_sec", 0.0),
+                })
+            self._emit({"type": "pipeline_start", "stages": stage_items})
         if only_stages is not None:
             self.workspace.append_jsonl(
                 "logs/execution.jsonl",
@@ -757,6 +793,15 @@ class PipelineOrchestrator:
                     "timestamp": now,
                 },
             )
+        self._emit({
+            "type": "stage",
+            "stage_id": stage_id,
+            "status": status.value,
+            "summary": summary,
+            "error": error,
+            "artifacts": list(artifacts),
+            "duration_sec": self.state["stages"][stage_id]["duration_sec"],
+        })
 
     def _compute_overall_status(self) -> StageStatus:
         if self._cancelled:

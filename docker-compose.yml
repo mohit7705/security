@@ -27,6 +27,7 @@ services:
       all_proxy: "http://egress-proxy:3128"
       NO_PROXY: "localhost,127.0.0.1,::1,egress-proxy"
       no_proxy: "localhost,127.0.0.1,::1,egress-proxy"
+      TERM: "${TERM:-xterm-256color}"
     volumes:
       - ./config:/app/config:ro
       - ./output:/app/output

@@ -4,7 +4,7 @@ PIP ?= $(PYTHON) -m pip
 # Keep bytecode out of src/ (a test asserts the source tree has no .pyc files).
 export PYTHONPYCACHEPREFIX := $(CURDIR)/build/pycache
 
-.PHONY: help install test compile wheel benchmark docker-build clean ci
+.PHONY: help install test compile wheel benchmark wordlists docker-build clean ci
 
 help:
 	@echo "install       Install the project and development dependencies"
@@ -12,6 +12,7 @@ help:
 	@echo "test          Run the complete pytest suite"
 	@echo "wheel         Build a wheel without resolving dependencies"
 	@echo "benchmark     Run offline synthetic microbenchmarks"
+	@echo "wordlists     Build the SecLists directory wordlist"
 	@echo "docker-build  Build the hardened Docker image"
 	@echo "clean         Remove generated build and test artifacts"
 install:
@@ -28,6 +29,9 @@ wheel:
 
 benchmark:
 	$(PYTHON) scripts/benchmark_local.py
+
+wordlists:
+	sh scripts/fetch_wordlists.sh
 
 docker-build:
 	docker build -t security-analyzer:local .

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -170,6 +170,7 @@ def execute_scan(
     project_root: Path | None = None,
     output_root: str | None = None,
     baseline_scan_id: str | None = None,
+    on_ready: Callable[[PipelineOrchestrator], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     try:
         orchestrator = build_orchestrator(
@@ -181,6 +182,8 @@ def execute_scan(
             output_root=output_root,
             baseline_scan_id=baseline_scan_id,
         )
+        if on_ready is not None:
+            on_ready(orchestrator)
         overall = orchestrator.run(resume=False)
         if orchestrator.state.get("cancelled"):
             return 130, orchestrator.state
@@ -199,6 +202,7 @@ def resume_scan(
     project_root: Path | None = None,
     output_root: str | None = None,
     baseline_scan_id: str | None = None,
+    on_ready: Callable[[PipelineOrchestrator], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     try:
         settings = load_settings(settings_path)
@@ -227,6 +231,8 @@ def resume_scan(
             output_root=output_root,
             baseline_scan_id=effective_baseline,
         )
+        if on_ready is not None:
+            on_ready(orchestrator)
         overall = orchestrator.run(resume=True, only_stages=only_stages)
         if orchestrator.state.get("cancelled"):
             return 130, orchestrator.state

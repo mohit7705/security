@@ -9,14 +9,14 @@ timeouts:
   http_read_sec: 20
   max_redirects: 5
   subfinder_sec: 120
-  directory_scan_sec: 180
+  directory_scan_sec: 420
   katana_sec: 120
-  feroxbuster_sec: 180
+  feroxbuster_sec: 420
   gau_sec: 120
   waybackurls_sec: 120
   httpx_sec: 120
   whatweb_sec: 120
-  nuclei_sec: 300
+  nuclei_sec: 900
   tls_sec: 10
   dns_sec: 8
   whois_sec: 10
@@ -24,10 +24,10 @@ timeouts:
 limits:
   max_urls_per_stage: 2500
   max_header_review_endpoints: 50
-  max_directory_words: 250
+  max_directory_words: 4000
   max_concurrent_requests: 10
-  max_total_requests: 10000
-  requests_per_host_per_sec: 5
+  max_total_requests: 60000
+  requests_per_host_per_sec: 10
   max_response_bytes: 5242880
   max_external_processes: 1000
   max_concurrent_processes: 3
@@ -59,13 +59,13 @@ browser:
     height: 768
 
 wordlists:
-  directories: ""
+  directories: "config/wordlists/quiver-directories.txt"
 
 tls:
   verify_certificates: true
 
 nuclei:
-  max_targets: 100
+  max_targets: 300
   rate_limit: 25
   concurrency: 10
   bulk_size: 10
@@ -74,16 +74,16 @@ nuclei:
   inactivity_timeout_sec: 180
 
 deep_checks:
-  max_authz_endpoints: 60
-  max_logic_endpoints: 60
+  max_authz_endpoints: 200
+  max_logic_endpoints: 200
   # No state-changing probes are performed by Step 7.
   allow_state_changing_probes: false
   # Rewrite-header checks are read-only but opt-in because they alter routing behavior.
-  enable_rewrite_header_probes: false
+  enable_rewrite_header_probes: true
   # The largest pagination value Step 7 will send in a GET request.
   max_pagination_probe_value: 1000
   # Read-only GET parameter canary probes (reflection, open redirect, error leaks).
-  enable_parameter_canary: false
+  enable_parameter_canary: true
   max_canary_endpoints: 30
   max_canary_params_per_endpoint: 5
 
