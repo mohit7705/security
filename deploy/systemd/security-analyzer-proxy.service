@@ -1,0 +1,27 @@
+[Unit]
+Description=Security Analyzer Scope-Aware Egress Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=security-proxy
+Group=security-proxy
+WorkingDirectory=/opt/security-analyzer
+Environment=PYTHONPATH=/opt/security-analyzer/src
+ExecStart=/opt/security-analyzer/.venv/bin/python -m security_analyzer.egress_proxy --scope /opt/security-analyzer/config/scope.yaml --host 127.0.0.1 --port 3128
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

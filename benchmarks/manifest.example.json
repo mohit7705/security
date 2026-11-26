@@ -1,0 +1,19 @@
+{
+  "benchmark": "example-authorized-lab-v1",
+  "target_application": "Replace with the exact lab application and version",
+  "expected_findings": [
+    {
+      "id": "LAB-001",
+      "category": "replace_with_exact_finding_category",
+      "title_contains": "replace with a stable title fragment",
+      "endpoint_contains": "/replace/with/known/endpoint",
+      "severity": "HIGH"
+    }
+  ],
+  "known_safe_controls": [
+    {
+      "id": "SAFE-001",
+      "endpoint_contains": "/public/health"
+    }
+  ]
+}

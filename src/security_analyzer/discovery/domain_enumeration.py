@@ -1,0 +1,669 @@
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from security_analyzer.core.orchestrator import ExecutionContext
+from security_analyzer.core.egress import is_trusted_scope_proxy
+from security_analyzer.core.resource_governor import ResourceLimitExceeded
+from security_analyzer.core.stage_registry import StageDefinition, StageResult, StageStatus
+from security_analyzer.discovery.endpoint_normalizer import normalize_endpoint
+from security_analyzer.discovery.inventory_store import UnifiedEndpointInventory
+from security_analyzer.models.asset import AssetRecord, make_asset_id
+
+
+def _scope_aware_proxy_env(tool_name: str) -> tuple[dict[str, str] | None, str]:
+    """Return a proxy-only environment; refuse external tools without the host guard."""
+    proxy_url = os.environ.get("SECURITY_ANALYZER_PROXY", "").strip()
+    enforced = os.environ.get("SECURITY_ANALYZER_EGRESS_ENFORCED") == "1"
+
+    local_proxy = is_trusted_scope_proxy(proxy_url)
+
+    if not enforced or not local_proxy:
+        return None, (
+            f"{tool_name} skipped: "
+            "enforced local scope-aware proxy is unavailable"
+        )
+
+    env = os.environ.copy()
+    env.update({
+        "HTTP_PROXY": proxy_url,
+        "HTTPS_PROXY": proxy_url,
+        "ALL_PROXY": proxy_url,
+        "http_proxy": proxy_url,
+        "https_proxy": proxy_url,
+        "all_proxy": proxy_url,
+        "NO_PROXY": "localhost,127.0.0.1,::1",
+        "no_proxy": "localhost,127.0.0.1,::1",
+    })
+
+    return env, ""
+
+
+def _run_external_tool(
+    tool_name: str,
+    command: list[str],
+    timeout_sec: int,
+    governor,
+) -> tuple[bool, str, str]:
+    """Execute a discovery binary under the shared process/resource governor."""
+
+    if governor is None:
+        return (
+            False,
+            "",
+            f"{tool_name} skipped: shared ResourceGovernor is unavailable",
+        )
+
+    env, reason = _scope_aware_proxy_env(tool_name)
+
+    if env is None:
+        return False, "", reason
+
+    try:
+        proc = governor.run_process(
+            command,
+            timeout_sec=timeout_sec,
+            env=env,
+        )
+
+    except ResourceLimitExceeded:
+        return (
+            False,
+            "",
+            f"{tool_name} exceeded its configured time/resource budget "
+            f"({timeout_sec}s)",
+        )
+
+    except OSError as exc:
+        return (
+            False,
+            "",
+            f"{tool_name} execution failed: {type(exc).__name__}",
+        )
+
+    if proc.timed_out:
+        return False, "", f"{tool_name} timed out after {timeout_sec}s"
+
+    if proc.output_truncated:
+        return (
+            False,
+            "",
+            f"{tool_name} output exceeded the configured process-output limit",
+        )
+
+    if proc.returncode != 0:
+        detail = (
+            (proc.stderr or "").strip()[:200]
+            or f"exit code {proc.returncode}"
+        )
+        return (
+            False,
+            "",
+            f"{tool_name} returned non-zero status: {detail}",
+        )
+
+    return True, proc.stdout or "", ""
+
+
+def _normalize_discovered_host(value: object) -> str | None:
+    """Extract a hostname from a scanner result without trusting its scope."""
+
+    if not isinstance(value, str):
+        return None
+
+    candidate = value.strip().lower().rstrip(".")
+
+    if not candidate:
+        return None
+
+    if candidate.startswith("*."):
+        candidate = candidate[2:]
+
+    if "://" in candidate:
+        candidate = urlsplit(candidate).hostname or ""
+    else:
+        candidate = candidate.split("/", 1)[0].split(":", 1)[0]
+
+    candidate = candidate.strip().rstrip(".")
+
+    if (
+        not candidate
+        or len(candidate) > 253
+        or any(ch.isspace() for ch in candidate)
+    ):
+        return None
+
+    if candidate.startswith(".") or ".." in candidate:
+        return None
+
+    return candidate
+
+
+def _run_subfinder(
+    root_domain: str,
+    timeout_sec: int,
+    governor=None,
+) -> tuple[bool, list[str], str]:
+
+    binary = shutil.which("subfinder")
+
+    if not binary:
+        return False, [], "subfinder binary not installed"
+
+    if governor is None:
+        return (
+            False,
+            [],
+            "subfinder skipped: shared ResourceGovernor is unavailable",
+        )
+
+    env, reason = _scope_aware_proxy_env("subfinder")
+
+    if env is None:
+        return False, [], reason
+
+    command = [
+        binary,
+        "-d", root_domain,
+        "-silent",
+        "-proxy", env["HTTP_PROXY"],
+    ]
+
+    ok, stdout, error = _run_external_tool(
+        "subfinder",
+        command,
+        timeout_sec,
+        governor,
+    )
+
+    if not ok:
+        return False, [], error
+
+    found = sorted({
+        host
+        for line in stdout.splitlines()
+        if (host := _normalize_discovered_host(line))
+    })
+
+    return True, found, ""
+
+
+def _run_assetfinder(
+    root_domain: str,
+    timeout_sec: int,
+    governor=None,
+) -> tuple[bool, list[str], str]:
+
+    binary = shutil.which("assetfinder")
+
+    if not binary:
+        return False, [], "assetfinder binary not installed"
+
+    command = [
+        binary,
+        "--subs-only",
+        root_domain,
+    ]
+
+    ok, stdout, error = _run_external_tool(
+        "assetfinder",
+        command,
+        timeout_sec,
+        governor,
+    )
+
+    if not ok:
+        return False, [], error
+
+    found = sorted({
+        host
+        for line in stdout.splitlines()
+        if (host := _normalize_discovered_host(line))
+    })
+
+    return True, found, ""
+
+
+def _run_amass(
+    root_domain: str,
+    timeout_sec: int,
+    governor=None,
+) -> tuple[bool, list[str], str]:
+
+    binary = shutil.which("amass")
+
+    if not binary:
+        return False, [], "amass binary not installed"
+
+    # Passive mode avoids active DNS brute forcing and direct target probing.
+    with tempfile.TemporaryDirectory(
+        prefix="security-analyzer-amass-"
+    ) as temp_dir:
+
+        output_path = Path(temp_dir) / "amass.json"
+
+        command = [
+            binary,
+            "enum",
+            "-passive",
+            "-d", root_domain,
+            "-json", str(output_path),
+        ]
+
+        ok, _stdout, error = _run_external_tool(
+            "amass",
+            command,
+            timeout_sec,
+            governor,
+        )
+
+        if not ok:
+            return False, [], error
+
+        if not output_path.is_file():
+            return (
+                False,
+                [],
+                "amass completed without producing its JSON output file",
+            )
+
+        found: set[str] = set()
+
+        try:
+            raw = output_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            try:
+                parsed = json.loads(raw)
+                records = parsed if isinstance(parsed, list) else [parsed]
+
+            except json.JSONDecodeError:
+                records = [
+                    json.loads(line)
+                    for line in raw.splitlines()
+                    if line.strip()
+                ]
+
+            for record in records:
+
+                if isinstance(record, dict):
+
+                    host = _normalize_discovered_host(
+                        record.get("name")
+                        or record.get("domain")
+                    )
+
+                    if host:
+                        found.add(host)
+
+        except (OSError, json.JSONDecodeError):
+            return (
+                False,
+                [],
+                "amass produced unreadable JSON output",
+            )
+
+        return True, sorted(found), ""
+
+
+def _run_bbot(
+    root_domain: str,
+    timeout_sec: int,
+    governor=None,
+) -> tuple[bool, list[str], str]:
+
+    binary = shutil.which("bbot")
+
+    if not binary:
+        return False, [], "bbot binary not installed"
+
+    # Use the subdomain-enum preset and parse JSON events from stdout.
+    with tempfile.TemporaryDirectory(
+        prefix="security-analyzer-bbot-"
+    ) as temp_dir:
+
+        command = [
+            binary,
+            "-t", root_domain,
+            "-f", "subdomain-enum",
+            "-om", "json",
+            "-o", temp_dir,
+            "--yes",
+            "--no-color",
+        ]
+
+        ok, stdout, error = _run_external_tool(
+            "bbot",
+            command,
+            timeout_sec,
+            governor,
+        )
+
+        if not ok:
+            return False, [], error
+
+        found: set[str] = set()
+
+        for line in stdout.splitlines():
+
+            try:
+                event = json.loads(line)
+
+            except json.JSONDecodeError:
+                continue
+
+            if (
+                isinstance(event, dict)
+                and event.get("type") == "DNS_NAME"
+            ):
+
+                host = _normalize_discovered_host(
+                    event.get("data")
+                )
+
+                if host:
+                    found.add(host)
+
+        return True, sorted(found), ""
+
+
+def run_domain_enumeration(
+    ctx: ExecutionContext,
+    stage_def: StageDefinition,
+) -> StageResult:
+
+    check_dns = True
+
+    seed_url = ctx.scope_engine.enforce_url(
+        ctx.target,
+        check_dns=check_dns,
+    )
+
+    parsed_seed = urlsplit(seed_url)
+
+    seed_host = (
+        parsed_seed.hostname or ""
+    ).lower().rstrip(".")
+
+    seed_port = parsed_seed.port or (
+        443 if parsed_seed.scheme == "https" else 80
+    )
+
+    candidate_hosts: dict[str, set[str]] = {
+        seed_host: {"target_seed"}
+    }
+
+    tools_used: set[str] = set()
+    notes: list[str] = []
+
+    enumeration_tools = (
+        ("subfinder", _run_subfinder),
+        ("amass", _run_amass),
+        ("assetfinder", _run_assetfinder),
+        ("bbot", _run_bbot),
+    )
+
+    if (
+        ctx.scope_engine.policy.include_subdomains
+        and ctx.scope_engine.policy.allowed_domains
+    ):
+
+        timeout_cfg = ctx.config.get("timeouts", {})
+
+        for root_domain in ctx.scope_engine.policy.allowed_domains:
+
+            for tool_name, runner in enumeration_tools:
+
+                timeout_sec = int(
+                    timeout_cfg.get(
+                        f"{tool_name}_sec",
+                        timeout_cfg.get("subfinder_sec", 120),
+                    )
+                )
+
+                ok, hosts, reason = runner(
+                    root_domain,
+                    timeout_sec,
+                    ctx.resource_governor,
+                )
+
+                if ok:
+
+                    tools_used.add(tool_name)
+
+                    for host in hosts:
+                        candidate_hosts.setdefault(
+                            host,
+                            set(),
+                        ).add(tool_name)
+
+                else:
+
+                    note = (
+                        f"{tool_name} ({root_domain}): {reason}"
+                    )
+
+                    notes.append(note)
+
+                    ctx.coverage.record_skipped_check(
+                        stage_def.stage_id,
+                        f"{tool_name}:{root_domain}",
+                        reason,
+                    )
+
+    else:
+
+        reason = (
+            "Subdomain enumeration skipped because "
+            "include_subdomains is false or only CIDRs are configured"
+        )
+
+        notes.append(reason)
+
+        for tool_name, _runner in enumeration_tools:
+
+            ctx.coverage.record_skipped_check(
+                stage_def.stage_id,
+                tool_name,
+                reason,
+            )
+
+    inventory = UnifiedEndpointInventory(ctx.workspace)
+
+    assets: list[AssetRecord] = []
+
+    max_urls = int(
+        ctx.config.get(
+            "limits",
+            {},
+        ).get(
+            "max_urls_per_stage",
+            2500,
+        )
+    )
+
+    for host in sorted(candidate_hosts.keys())[:max_urls]:
+
+        probe_url = f"{parsed_seed.scheme}://{host}"
+
+        if (
+            parsed_seed.scheme == "http"
+            and seed_port != 80
+        ) or (
+            parsed_seed.scheme == "https"
+            and seed_port != 443
+        ):
+            probe_url += f":{seed_port}"
+
+        probe_url += "/"
+
+        # Every enumerator result is DNS-validated and scope-checked here.
+        decision = ctx.scope_engine.evaluate_url(
+            probe_url,
+            check_dns=check_dns,
+        )
+
+        if not decision.allowed:
+
+            ctx.coverage.record_out_of_scope(
+                stage_def.stage_id,
+                probe_url,
+                decision.reason,
+            )
+
+            continue
+
+        resolved_ips = list(decision.resolved_ips)
+
+        if not resolved_ips:
+
+            ctx.coverage.record_out_of_scope(
+                stage_def.stage_id,
+                probe_url,
+                "No DNS-validated IP address available",
+            )
+
+            continue
+
+        sources = sorted(candidate_hosts[host])
+
+        root_domain = next(
+            (
+                domain
+                for domain in sorted(
+                    ctx.scope_engine.policy.allowed_domains,
+                    key=len,
+                    reverse=True,
+                )
+                if (
+                    host == domain
+                    or host.endswith("." + domain)
+                )
+            ),
+            host,
+        )
+
+        asset = AssetRecord(
+            asset_id=make_asset_id(host),
+            hostname=host,
+            root_domain=root_domain,
+            ip_addresses=resolved_ips,
+            ports=[seed_port],
+            in_scope=True,
+            sources=sources,
+        )
+
+        assets.append(asset)
+
+        inventory.upsert_asset(
+            host,
+            root_domain=root_domain,
+            ip_addresses=resolved_ips,
+            ports=[seed_port],
+            source=sources[0],
+            in_scope=True,
+        )
+
+        ctx.coverage.record_target_tested(
+            stage_def.stage_id,
+            decision.normalized_url,
+        )
+
+        ep = normalize_endpoint(
+            decision.normalized_url,
+            scope_engine=ctx.scope_engine,
+            source=sources[0],
+            check_dns=check_dns,
+        )
+
+        if ep is not None:
+
+            for src in sources[1:]:
+                ep.sources.append(src)
+
+            inventory.upsert_endpoint(ep)
+
+    inventory.save(stage_id=stage_def.stage_id)
+
+    payload = {
+        "schema_version": "1.0",
+        "scan_id": ctx.workspace.scan_id,
+        "stage_id": stage_def.stage_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "seed_target": seed_url,
+        "subfinder_used": "subfinder" in tools_used,
+        "enumeration_tools_used": sorted(tools_used),
+        "notes": notes,
+        "hosts": [
+            asset.to_dict()
+            for asset in assets
+        ],
+    }
+
+    ctx.workspace.write_json_atomic(
+        "discovery/subdomains.json",
+        payload,
+    )
+
+    subdomains_not_requested = not (
+        ctx.scope_engine.policy.include_subdomains
+        and ctx.scope_engine.policy.allowed_domains
+    )
+
+    status = (
+        StageStatus.SUCCESS
+        if (tools_used or subdomains_not_requested) and assets
+        else StageStatus.PARTIAL
+    )
+
+    summary = (
+        f"Enumerated {len(assets)} in-scope host(s) "
+        f"using {', '.join(sorted(tools_used))}"
+        if tools_used
+        else
+        "Seeded target host(s); subdomain enumeration was not requested"
+        if subdomains_not_requested and assets
+        else (
+            f"Seeded {len(assets)} in-scope host(s) "
+            "(all external enumeration tools unavailable/skipped)"
+        )
+    )
+
+    return StageResult(
+        stage_id=stage_def.stage_id,
+        status=status,
+        summary=summary,
+        artifacts=[
+            "discovery/subdomains.json",
+            "inventory/unified_endpoints.json",
+            "inventory/contributions/domain_enumeration.json",
+        ],
+        reusable_partial=(
+            status == StageStatus.PARTIAL
+            and not tools_used
+            and all(
+                "not installed" in note.lower()
+                or "skipped because include_subdomains" in note.lower()
+                or "only cidrs are configured" in note.lower()
+                for note in notes
+            )
+        ),
+        metrics={
+            "targets_total": len(candidate_hosts),
+            "targets_tested": len(assets),
+            "targets_skipped": max(
+                0,
+                len(candidate_hosts) - len(assets),
+            ),
+            "enumeration_tools_used": len(tools_used),
+        },
+    )

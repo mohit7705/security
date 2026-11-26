@@ -1,0 +1,38 @@
+# Copy to config/auth_profiles.yaml and provide secrets through environment variables.
+# Never commit real passwords, cookies, or tokens.
+verify_logout_invalidation: false
+
+identities:
+  user_a:
+    role: "standard_user"
+    auth_method: "api_login"
+    # Optional: exact resource IDs this identity is authorized to own.
+    # Required for reliable horizontal IDOR ownership attribution.
+    owned_resource_ids:
+      - "12345"
+    login_url: "https://example.com/api/auth/login"
+    whoami_url: "https://example.com/api/auth/me"
+    refresh_url: "https://example.com/api/auth/refresh"
+    logout_url: "https://example.com/api/auth/logout"
+    credentials:
+      username: "${USER_A_EMAIL}"
+      password: "${USER_A_PASSWORD}"
+    token_json_path: "access_token"
+    refresh_token_json_path: "refresh_token"
+    header_name: "Authorization"
+    header_prefix: "Bearer"
+    # Browser credentials are sent only to these exact origins.
+    # If omitted, the scan target origin is used.
+    browser_auth_origins:
+      - "https://example.com"
+    session_storage:
+      "https://example.com":
+        role_hint: "user"
+
+  user_b:
+    role: "standard_user"
+    auth_method: "bearer_token"
+    whoami_url: "https://example.com/api/auth/me"
+    token: "${USER_B_TOKEN}"
+    header_name: "Authorization"
+    header_prefix: "Bearer"

@@ -1,0 +1,15 @@
+headless: true
+browser_type: "chromium"
+max_pages: 25
+max_depth: 2
+max_identities: 5
+max_console_events: 500
+navigation_timeout_ms: 15000
+settle_wait_ms: 1200
+capture_screenshots: true
+max_screenshots: 15
+record_har: true
+har_mode: "minimal"
+viewport:
+  width: 1366
+  height: 768

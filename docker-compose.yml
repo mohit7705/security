@@ -1,0 +1,123 @@
+services:
+  security-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INSTALL_BROWSER: ${INSTALL_BROWSER:-true}
+    image: security-analyzer:latest
+    container_name: security-analyzer
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["while :; do sleep 3600; done"]
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SECURITY_ANALYZER_PROXY: "http://egress-proxy:3128"
+      SECURITY_ANALYZER_PROXY_TRANSPORT: "docker"
+      SECURITY_ANALYZER_EGRESS_ENFORCED: "1"
+      HTTP_PROXY: "http://egress-proxy:3128"
+      HTTPS_PROXY: "http://egress-proxy:3128"
+      ALL_PROXY: "http://egress-proxy:3128"
+      http_proxy: "http://egress-proxy:3128"
+      https_proxy: "http://egress-proxy:3128"
+      all_proxy: "http://egress-proxy:3128"
+      NO_PROXY: "localhost,127.0.0.1,::1,egress-proxy"
+      no_proxy: "localhost,127.0.0.1,::1,egress-proxy"
+    volumes:
+      - ./config:/app/config:ro
+      - ./output:/app/output
+      - ./secrets:/app/secrets
+    networks:
+      - scanner_internal
+    mem_limit: 3g
+    cpus: "2.0"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD", "quiver", "doctor", "--profile", "core-only"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  egress-proxy:
+    image: security-analyzer:latest
+    container_name: security-analyzer-egress-proxy
+    entrypoint:
+      - python
+      - -m
+      - security_analyzer.egress_proxy
+    command:
+      - --scope
+      - /app/config/scope.yaml
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3128"
+    volumes:
+      - ./config:/app/config:ro
+    networks:
+      - scanner_internal
+      - scanner_egress
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; s=socket.create_connection(('127.0.0.1', 3128), timeout=2); s.close()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+
+
+  # Opt-in isolated benchmark target. It is not started by the default profile.
+  juice-shop:
+    image: bkimminich/juice-shop:v17.1.1
+    profiles: ["lab"]
+    container_name: quiver-juice-shop-lab
+    networks:
+      - scanner_internal
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+networks:
+  scanner_internal:
+    internal: true
+  scanner_egress:
+    driver: bridge

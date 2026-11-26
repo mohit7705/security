@@ -1,0 +1,20 @@
+# Scope template: replace example.com with the explicitly authorized domain.
+# --target does not expand or override this allow-list.
+allowed_domains:
+  - "example.com"
+
+include_subdomains: true
+allowed_schemes:
+  - "http"
+  - "https"
+
+allowed_ports:
+  - 80
+  - 443
+
+excluded_paths:
+  - "/logout"
+  - "/signout"
+  - "/admin/delete"
+
+allow_private_ips: false

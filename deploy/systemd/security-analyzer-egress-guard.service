@@ -1,0 +1,12 @@
+[Unit]
+Description=Security Analyzer Outbound Network Guard
+After=network-pre.target
+Before=security-analyzer-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/security-analyzer-egress-guard security-analyzer
+
+[Install]
+WantedBy=multi-user.target

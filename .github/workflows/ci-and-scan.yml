@@ -1,0 +1,288 @@
+name: Quiver CI and controlled lab scan
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_juice_shop_scan:
+        description: "Run the opt-in scan against the isolated local OWASP Juice Shop container"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quiver-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Compile source without writing bytecode
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          roots = (Path("src"), Path("tests"), Path("scripts"))
+          files = [p for root in roots for p in root.rglob("*.py")]
+          for path in files:
+              compile(path.read_text(encoding="utf-8"), str(path), "exec")
+          print(f"Compiled {len(files)} Python files in memory")
+          PY
+
+      - name: Run full test suite
+        run: python -m pytest -q -p no:cacheprovider
+
+      - name: Build wheel
+        run: |
+          python -m pip wheel . --no-deps --wheel-dir dist
+          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+
+      - name: Install wheel and verify Quiver entry point
+        run: |
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          quiver --version | grep -Fx "quiver 0.1.0"
+          quiver stages > /tmp/quiver-stages.json
+          python -c "import json; p=json.load(open('/tmp/quiver-stages.json')); assert len(p) == 15"
+
+  docker-compose-smoke:
+    name: Hardened Docker and Compose smoke test
+    runs-on: ubuntu-latest
+    env:
+      INSTALL_BROWSER: "false"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate Docker Compose configuration
+        run: |
+          cp .env.example .env
+          mkdir -p output secrets
+          docker compose version
+          docker compose config --quiet
+
+      - name: Build production image
+        run: docker compose build --pull
+
+      - name: Start isolated analyzer and egress proxy
+        run: docker compose up -d
+
+      - name: Wait for health checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            analyzer="$(docker inspect --format '{{.State.Health.Status}}' security-analyzer 2>/dev/null || true)"
+            proxy="$(docker inspect --format '{{.State.Health.Status}}' security-analyzer-egress-proxy 2>/dev/null || true)"
+            if [[ "$analyzer" == "healthy" && "$proxy" == "healthy" ]]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker compose ps
+          docker compose logs --tail=150
+          exit 1
+
+      - name: Assert non-root runtime and Quiver CLI
+        run: |
+          test "$(docker compose exec -T security-analyzer id -u | tr -d '\r')" = "1000"
+          docker compose exec -T security-analyzer quiver --version | grep -Fx "quiver 0.1.0"
+
+      - name: Assert analyzer has no direct egress and proxy is not published
+        run: |
+          docker compose exec -T security-analyzer python - <<'PY'
+          import socket
+          sock = socket.socket()
+          sock.settimeout(3)
+          try:
+              sock.connect(("1.1.1.1", 443))
+          except OSError:
+              raise SystemExit(0)
+          else:
+              raise SystemExit("direct egress unexpectedly succeeded")
+          finally:
+              sock.close()
+          PY
+          docker compose config --format json > /tmp/quiver-compose.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          config = json.loads(Path("/tmp/quiver-compose.json").read_text())
+          assert not config["services"]["egress-proxy"].get("ports"), (
+              "The egress proxy must not publish a host port"
+          )
+          PY
+
+      - name: Stop Compose stack
+        if: always()
+        run: docker compose down --remove-orphans
+
+  juice-shop-lab:
+    name: Opt-in isolated OWASP Juice Shop assessment
+    if: github.event_name == 'workflow_dispatch' && inputs.run_juice_shop_scan
+    needs: [docker-compose-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      INSTALL_BROWSER: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Prepare an explicit local-only scope policy
+        run: |
+          cp .env.example .env
+          mkdir -p output secrets
+          cat > config/scope.yaml <<'YAML'
+          allowed_domains:
+            - "juice-shop"
+          include_subdomains: false
+          allowed_schemes:
+            - "http"
+          allowed_ports:
+            - 3000
+          excluded_paths: []
+          allow_private_ips: true
+          YAML
+          cat > config/ci-juice-shop-settings.yaml <<'YAML'
+          output_root: "output"
+          timeouts:
+            http_connect_sec: 5
+            http_read_sec: 10
+            max_redirects: 3
+            subfinder_sec: 15
+            directory_scan_sec: 30
+            nuclei_sec: 60
+            tls_sec: 5
+            dns_sec: 5
+          limits:
+            max_urls_per_stage: 100
+            max_directory_words: 50
+            max_header_review_endpoints: 20
+            max_concurrent_requests: 3
+            max_total_requests: 500
+            requests_per_host_per_sec: 2
+            max_response_bytes: 1048576
+            max_external_processes: 20
+            max_concurrent_processes: 2
+            max_process_output_bytes: 524288
+            max_scan_duration_sec: 600
+          browser:
+            headless: true
+            lab_mode: true
+            max_pages: 10
+            max_depth: 1
+            navigation_timeout_ms: 10000
+            settle_wait_ms: 300
+            capture_screenshots: false
+            max_screenshots: 0
+            max_identities: 2
+            max_console_events: 50
+            record_har: false
+            har_mode: "minimal"
+            katana_enabled: false
+            viewport:
+              width: 1280
+              height: 720
+          nuclei:
+            max_targets: 10
+            rate_limit: 5
+            concurrency: 2
+            bulk_size: 2
+            severities: "low,medium,high,critical"
+            inactivity_timeout_sec: 45
+          deep_checks:
+            max_authz_endpoints: 10
+            max_logic_endpoints: 10
+            allow_state_changing_probes: false
+            enable_rewrite_header_probes: false
+            max_pagination_probe_value: 100
+            enable_parameter_canary: false
+            max_canary_endpoints: 5
+            max_canary_params_per_endpoint: 2
+          ai_triage:
+            enabled: false
+          YAML
+
+      - name: Build and start isolated lab services
+        run: |
+          docker compose build --pull
+          docker compose --profile lab up -d
+
+      - name: Wait for lab services
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            proxy="$(docker inspect --format '{{.State.Health.Status}}' security-analyzer-egress-proxy 2>/dev/null || true)"
+            app="$(docker inspect --format '{{.State.Health.Status}}' quiver-juice-shop-lab 2>/dev/null || true)"
+            if [[ "$proxy" == "healthy" && "$app" == "healthy" ]]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker compose ps
+          docker compose logs --tail=150
+          exit 1
+
+      - name: Run scoped local lab assessment
+        shell: bash
+        run: |
+          set +e
+          docker compose exec -T security-analyzer quiver scan \
+            --target http://juice-shop:3000/ \
+            --scope config/scope.yaml \
+            --settings config/ci-juice-shop-settings.yaml \
+            > output/ci-juice-shop-cli.json
+          scan_exit=$?
+          set -e
+          if [[ "$scan_exit" -ne 0 && "$scan_exit" -ne 2 ]]; then
+            cat output/ci-juice-shop-cli.json
+            exit "$scan_exit"
+          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          payload = json.loads(Path("output/ci-juice-shop-cli.json").read_text())
+          scan_id = payload.get("scan_id")
+          if not isinstance(scan_id, str) or not scan_id:
+              raise SystemExit("CLI output did not contain a scan_id")
+          report = Path("output") / scan_id / "reports" / "security_report.json"
+          if not report.is_file() or report.stat().st_size == 0:
+              raise SystemExit("The lab scan did not produce a non-empty final report")
+          parsed = json.loads(report.read_text())
+          if parsed.get("scan_id") != scan_id:
+              raise SystemExit("Final report scan_id does not match CLI output")
+          print(f"Validated isolated Juice Shop report for scan {scan_id}")
+          PY
+
+      - name: Stop lab services
+        if: always()
+        run: docker compose --profile lab down --remove-orphans

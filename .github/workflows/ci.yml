@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[dev,browser]"
+
+      - name: Compile source and tests
+        run: python -m compileall -q src tests scripts
+
+      - name: Run test suite
+        run: python -m pytest -q
+
+      - name: Build wheel
+        run: python -m pip wheel . --no-deps --wheel-dir dist
+
+      - name: Install wheel in a clean environment and check the CLI
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist/*.whl
+          /tmp/wheel-venv/bin/security-analyzer stages > /dev/null
+
+  docker-build:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build runtime image
+        run: docker build -t security-analyzer:ci .
+
+      - name: Check image contents and non-root execution
+        run: |
+          docker run --rm --entrypoint sh security-analyzer:ci -c \
+            'test ! -e /app/.env && test ! -e /app/auth_profiles.yaml && \
+             test -z "$(find /app/output -mindepth 1 -print -quit)" && \
+             test -z "$(find /app -type f \( -name "*.pyc" -o -name "*.pyo" \) -print -quit)"'
+          user="$(docker run --rm --entrypoint id security-analyzer:ci -u)"
+          test "$user" != "0"
