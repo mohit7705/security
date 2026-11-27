@@ -214,8 +214,12 @@ class ScopedBrowserManager:
         acquired_budget = False
         try:
             if self.resource_governor is not None:
-                self.resource_governor.acquire_request(url)
-                acquired_budget = True
+                self.resource_governor.acquire_request(url, timeout=10)
+                # Release at once: the request budget and per-host rate limit are
+                # already enforced. Holding the slot while calling Playwright
+                # (all_headers/continue_) lets nested route handlers pile up and
+                # deadlock once more than max_concurrent_requests are pending.
+                self.resource_governor.release_request()
 
             all_headers = getattr(request, "all_headers", None)
             try:

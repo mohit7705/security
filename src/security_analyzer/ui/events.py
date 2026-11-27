@@ -1,11 +1,11 @@
-"""Formatting and safe output-file helpers shared by the progress views."""
+"""Formatting, banner, and safe output-file helpers shared by progress views."""
 from __future__ import annotations
 
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from security_analyzer.utils.redaction import scrub_text
 
@@ -18,9 +18,69 @@ MAX_JSON_BYTES = 5 * 1024 * 1024
 PREVIEW_READ_BYTES = 64 * 1024
 COUNT_KEYS = ("endpoints", "findings", "records", "hosts", "tests", "operations", "routes", "observations", "entries", "items")
 
+QUIVER_BANNER_ART = r"""
+   ____        _                
+  / __ \__  __(_)   _____  _____
+ / / / / / / / / | / / _ \/ ___/
+/ /_/ / /_/ / /| |/ /  __/ /    
+\___\_\__,_/_/ |___/\___/_/     
+""".strip("\n")
 
-def supports_unicode() -> bool:
-    return os.environ.get("QUIVER_ASCII") != "1" and "utf" in (getattr(sys.stdout, "encoding", None) or "").lower()
+
+def supports_unicode(stream: TextIO | None = None) -> bool:
+    target = stream or sys.stderr
+    return os.environ.get("QUIVER_ASCII") != "1" and "utf" in (getattr(target, "encoding", None) or "").lower()
+
+
+def supports_color(stream: TextIO | None = None) -> bool:
+    if os.environ.get("NO_COLOR") or os.environ.get("QUIVER_NO_COLOR") == "1":
+        return False
+    target = stream or sys.stderr
+    try:
+        is_tty = bool(target.isatty())
+    except Exception:
+        is_tty = False
+    return is_tty and os.environ.get("TERM", "") not in {"", "dumb"}
+
+
+def style_text(text: str, code: str, *, color_ok: bool) -> str:
+    if not color_ok or not code:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def render_banner(
+    *,
+    version: str = "0.1.0",
+    target: str = "",
+    scan_id: str = "",
+    output_dir: str = "",
+    total_stages: int = 15,
+    unicode_ok: bool = True,
+    color_ok: bool = True,
+) -> str:
+    rule = ("─" if unicode_ok else "-") * 62
+    art = style_text(QUIVER_BANNER_ART, "1;36", color_ok=color_ok)
+    ver = style_text(f"v{version}", "1;37", color_ok=color_ok)
+    tagline = style_text("  Scope-Enforced Security Assessment Pipeline", "2", color_ok=color_ok)
+    inf = style_text("[INF]", "36", color_ok=color_ok)
+
+    lines = [
+        f"{art}  {ver}",
+        "",
+        tagline,
+        style_text(rule, "2", color_ok=color_ok),
+    ]
+    if target:
+        lines.append(f"  {inf} Target   : {scrub_text(target)}")
+    if scan_id:
+        lines.append(f"  {inf} Scan ID  : {scan_id}")
+    if output_dir:
+        lines.append(f"  {inf} Output   : {output_dir}")
+    if total_stages > 0:
+        lines.append(f"  {inf} Pipeline : {total_stages} steps")
+    lines.append(style_text(rule, "2", color_ok=color_ok))
+    return "\n".join(lines)
 
 
 def status_symbol(status: str, frame: int = 0, unicode_ok: bool | None = None) -> str:
@@ -48,6 +108,30 @@ def fmt_size(size: int | float) -> str:
             return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} GB"
+
+
+def display_scan_dir(scan_dir: str | Path) -> str:
+    raw = str(scan_dir or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw)
+    try:
+        rel = path.resolve().relative_to(Path.cwd().resolve())
+        return str(rel)
+    except (ValueError, OSError):
+        return raw
+
+
+def format_output_location(scan_dir: str | Path, info: dict[str, Any]) -> str:
+    base = display_scan_dir(scan_dir)
+    rel = str(info.get("path", "")).lstrip("/")
+    full_path = f"{base}/{rel}" if base else rel
+    if not info.get("exists"):
+        return f"{full_path} (not written)"
+    parts = [fmt_size(info["size"])]
+    if info.get("count") is not None:
+        parts.append(f"{info['count']} {info['count_label']}")
+    return f"{full_path} ({' · '.join(parts)})"
 
 
 def _inside(scan_dir: Path, relative: str) -> Path | None:

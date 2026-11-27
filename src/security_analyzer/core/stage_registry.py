@@ -133,11 +133,6 @@ STAGE_DEFINITIONS: tuple[StageDefinition, ...] = (
         artifacts=(ArtifactSpec("analysis/tls_posture.json", ("schema_version", "scan_id", "stage_id", "results")),),
     ),
     StageDefinition(
-        "nuclei_assessment", "Nuclei Template Vulnerability Scan", "analysis",
-        dependencies=("redirect_analysis", "auth_session_lifecycle"),
-        artifacts=(ArtifactSpec("analysis/nuclei_findings.json", ("schema_version", "scan_id", "stage_id", "findings")),),
-    ),
-    StageDefinition(
         "server_dns_checks", "DNS & Infrastructure Posture Checks", "analysis",
         dependencies=("domain_enumeration",),
         artifacts=(ArtifactSpec("analysis/dns_infrastructure.json", ("schema_version", "scan_id", "stage_id", "records")),),
@@ -156,6 +151,12 @@ STAGE_DEFINITIONS: tuple[StageDefinition, ...] = (
         ),
     ),
     StageDefinition(
+        "nuclei_assessment", "Nuclei Template Vulnerability Scan", "analysis",
+        dependencies=("redirect_analysis", "auth_session_lifecycle", "api_js_intelligence"),
+        optional_dependencies=("api_js_intelligence",),
+        artifacts=(ArtifactSpec("analysis/nuclei_findings.json", ("schema_version", "scan_id", "stage_id", "findings")),),
+    ),
+    StageDefinition(
         "authorization_idor", "Multi-Identity Authorization & IDOR Analysis", "deep_checks",
         dependencies=("auth_session_lifecycle", "api_js_intelligence"),
         artifacts=(ArtifactSpec("analysis/authorization_matrix.json", ("schema_version", "scan_id", "stage_id", "tests")),),
@@ -168,8 +169,8 @@ STAGE_DEFINITIONS: tuple[StageDefinition, ...] = (
     StageDefinition(
         "evidence_verification", "Deterministic Replay & Evidence Verification", "verification",
         dependencies=(
-            "security_review", "online_security_checks", "nuclei_assessment", "server_dns_checks",
-            "api_js_intelligence", "authorization_idor", "business_logic_checks",
+            "security_review", "online_security_checks", "server_dns_checks",
+            "api_js_intelligence", "nuclei_assessment", "authorization_idor", "business_logic_checks",
         ),
         optional_dependencies=("online_security_checks", "nuclei_assessment", "server_dns_checks"),
         artifacts=(ArtifactSpec("verification/verified_findings.json", ("schema_version", "scan_id", "stage_id", "findings")),),

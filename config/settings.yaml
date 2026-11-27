@@ -26,7 +26,7 @@ timeouts:
   api_intel_stage_sec: 600
   authz_stage_sec: 600
   logic_stage_sec: 300
-  security_review_stage_sec: 300
+  security_review_stage_sec: 900
   whatweb_sec: 120
   nuclei_sec: 900
   tls_sec: 10
@@ -42,8 +42,8 @@ limits:
   max_api_inventory_endpoints: 5000
   deep_checks_max_failure_ratio: 0.5
   header_review_max_failure_ratio: 0.5
-  max_header_review_endpoints: 50
-  max_directory_words: 4000
+  max_header_review_endpoints: 500
+  max_directory_words: 25000
   max_concurrent_requests: 10
   max_total_requests: 60000
   requests_per_host_per_sec: 10
@@ -57,17 +57,17 @@ limits:
 browser:
   headless: true
   lab_mode: false  # set true only for loopback/private lab targets
-  max_pages: 25
-  max_depth: 2
+  max_pages: 60
+  max_depth: 3
   navigation_timeout_ms: 15000
   settle_wait_ms: 1200
   capture_screenshots: true
-  max_screenshots: 15
+  max_screenshots: 30
   max_identities: 5
   max_console_events: 500
   record_har: true
   har_mode: "minimal"
-  max_attempts: 50                 # total navigations incl. failures (default 2 x max_pages)
+  max_attempts: 120                 # total navigations incl. failures (default 2 x max_pages)
   max_crawl_sec_per_identity: 600  # wall-clock cap per identity
   max_stage_sec: 1800              # wall-clock cap for the whole browser stage
   max_consecutive_failures: 5      # stop an identity after N failed navigations in a row
@@ -85,6 +85,7 @@ browser:
     height: 768
 
 wordlists:
+  # Point this to your larger wordlist (e.g. fetched via scripts/fetch_wordlists.sh)
   directories: "config/wordlists/quiver-directories.txt"
 
 tls:
@@ -92,6 +93,8 @@ tls:
 
 nuclei:
   max_targets: 300
+  # true = run nuclei even when scope.yaml has excluded_paths (targets still scope-filtered)
+  allow_with_excluded_paths: true
   rate_limit: 25
   concurrency: 10
   bulk_size: 10
@@ -100,8 +103,8 @@ nuclei:
   inactivity_timeout_sec: 180
 
 deep_checks:
-  max_authz_endpoints: 200
-  max_logic_endpoints: 200
+  max_authz_endpoints: 400
+  max_logic_endpoints: 400
   # No state-changing probes are performed by Step 7.
   allow_state_changing_probes: false
   # Rewrite-header checks are read-only but opt-in because they alter routing behavior.
@@ -110,17 +113,17 @@ deep_checks:
   max_pagination_probe_value: 1000
   # Read-only GET parameter canary probes (reflection, open redirect, error leaks).
   enable_parameter_canary: true
-  max_canary_endpoints: 30
+  max_canary_endpoints: 100
   max_canary_params_per_endpoint: 5
 
 ai_triage:
-  enabled: false
+  enabled: true
   # Supported providers: openrouter, groq, gemini, meta, openai, local.
   # Remote provider traffic remains subject to the host egress guard/proxy.
   # Use provider=local for a loopback OpenAI-compatible endpoint (for example Ollama).
-  provider: "openrouter"
-  model: ""
-  endpoint_url: ""
+  provider: "meta"
+  model: "muse-spark-1.3"
+  endpoint_url: "https://api.meta.ai/v1"
   allowed_hosts: []
   timeout_sec: 20
-  max_findings: 25
+  max_findings: 99

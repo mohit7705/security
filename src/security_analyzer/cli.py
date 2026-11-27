@@ -69,10 +69,16 @@ def _add_scan_arguments(parser: argparse.ArgumentParser) -> None:
         help="Prior scan ID to diff new subdomains, endpoints, ports, and findings against",
     )
     parser.add_argument(
+        "--preflight",
+        choices=["off", "core-only", "browser-enabled", "full-scanner"],
+        default="full-scanner",
+        help="Run preflight doctor check before starting the scan (default: full-scanner)",
+    )
+    parser.add_argument(
         "--ui",
         choices=["auto", "tui", "plain", "off"],
         default=None,
-        help="Progress display: auto, tui, plain, or off. Env: QUIVER_UI",
+        help="Progress display: auto, plain, or off. Env: QUIVER_UI",
     )
 
 
@@ -100,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         "      --auth-profiles F   Authenticated test identities for IDOR/authorization checks\n"
         "      --output-root DIR   Where scan results are stored (default: output)\n"
         "      --baseline SCAN_ID  Compare against an earlier scan\n"
+        "      --preflight MODE    Preflight profile before scanning (default: full-scanner)\n"
         "\n"
         "Other commands:\n"
         "  quiver -h | --help | -help                             Show this help message\n"
@@ -481,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command in {"scan", "attack"}:
             ui_mode = resolve_ui_mode(args.ui)
+            preflight_profile = None if args.preflight == "off" else args.preflight
             code, state = run_scan_with_ui(
                 mode=ui_mode,
                 target=args.target,
@@ -491,10 +499,11 @@ def main(argv: list[str] | None = None) -> int:
                     auth_profiles_path=args.auth_profiles,
                     output_root=args.output_root,
                     baseline_scan_id=args.baseline,
+                    preflight_profile=preflight_profile,
                     on_ready=on_ready,
                 ),
             )
-            if ui_mode == "tui":
+            if ui_mode != "off":
                 print_tui_summary(state, code, args.output_root)
             else:
                 print(json.dumps(state, indent=2, sort_keys=True))
@@ -517,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
                     on_ready=on_ready,
                 ),
             )
-            if ui_mode == "tui":
+            if ui_mode != "off":
                 print_tui_summary(state, code, args.output_root)
             else:
                 print(json.dumps(state, indent=2, sort_keys=True))

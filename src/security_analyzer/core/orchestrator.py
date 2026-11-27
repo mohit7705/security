@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import traceback
+import inspect
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -603,6 +605,11 @@ class PipelineOrchestrator:
                 }),
             )
             try:
+                runner_source = inspect.getsourcefile(runner) or inspect.getfile(runner)
+                self._append_stage_diagnostic(
+                    stage_id,
+                    f"START | runner={runner.__module__}.{getattr(runner, '__name__', type(runner).__name__)} | source={runner_source}",
+                )
                 result = runner(context, stage_def)
             except KeyboardInterrupt:
                 self._cancelled = True
@@ -622,11 +629,16 @@ class PipelineOrchestrator:
                 )
                 break
             except Exception as exc:
+                diagnostic_traceback = traceback.format_exc()
+                self._append_stage_diagnostic(
+                    stage_id,
+                    f"UNHANDLED EXCEPTION: {type(exc).__name__}: {exc}\n{diagnostic_traceback}",
+                )
                 result = StageResult(
                     stage_id=stage_id,
                     status=StageStatus.FAILED,
                     summary=f"Unhandled stage exception: {type(exc).__name__}",
-                    error=scrub_text(str(exc)),
+                    error=scrub_text(f"{type(exc).__name__}: {exc}\n{diagnostic_traceback}"),
                 )
             shared_auth_manager = context.auth_manager
 
@@ -732,6 +744,18 @@ class PipelineOrchestrator:
         self._persist_state()
         return overall
 
+    def _append_stage_diagnostic(self, stage_id: str, message: str) -> None:
+        """Append a sanitized diagnostic line to this stage's dedicated log."""
+        safe_message = scrub_text(message)
+        self.workspace.append_jsonl(
+            f"logs/stage_{stage_id}.jsonl",
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "stage_id": stage_id,
+                "message": safe_message,
+            },
+        )
+
     def _record_stage_state(
         self,
         *,
@@ -768,6 +792,11 @@ class PipelineOrchestrator:
             "artifact_hashes": dict(artifact_hashes or {}),
             "updated_at": now,
         }
+        self._append_stage_diagnostic(
+            stage_id,
+            f"status={status.value} | summary={summary} | error={error or '-'} | "
+            f"duration_sec={self.state['stages'][stage_id]['duration_sec']}",
+        )
         self._persist_state()
         self.workspace.append_jsonl(
             "logs/execution.jsonl",

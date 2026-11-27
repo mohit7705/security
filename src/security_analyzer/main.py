@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
+import os
+import shutil
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -120,7 +123,7 @@ def build_orchestrator(
     if policy.allowed_domains == ["example.com"] and target_host and target_host != "example.com":
         policy = ScopePolicy(
             allowed_domains=[target_host],
-            include_subdomains=False,
+            include_subdomains=os.environ.get("QUIVER_INCLUDE_SUBDOMAINS") == "1",
             allowed_schemes=list(policy.allowed_schemes),
             allowed_ports=list(policy.allowed_ports),
             excluded_paths=list(policy.excluded_paths),
@@ -130,7 +133,7 @@ def build_orchestrator(
         settings["scope_resolution"] = {
             "mode": "default_exact_host",
             "host": target_host,
-            "include_subdomains": False,
+            "include_subdomains": os.environ.get("QUIVER_INCLUDE_SUBDOMAINS") == "1",
             "reason": "Default example.com template was bound to the explicitly supplied target host; subdomains require explicit scope.",
         }
     scope_engine = ScopeEngine(policy)
@@ -157,20 +160,105 @@ def register_available_stages(orchestrator: PipelineOrchestrator) -> None:
     orchestrator.register_runner("redirect_analysis", run_redirect_analysis)
     orchestrator.register_runner("security_review", run_security_review)
     orchestrator.register_runner("online_security_checks", run_online_security_checks)
-    orchestrator.register_runner("nuclei_assessment", run_nuclei_assessment)
     orchestrator.register_runner("server_dns_checks", run_server_dns_checks)
     orchestrator.register_runner("api_js_intelligence", run_api_js_intelligence)
+    orchestrator.register_runner("nuclei_assessment", run_nuclei_assessment)
     orchestrator.register_runner("authorization_idor", run_authorization_idor)
     orchestrator.register_runner("business_logic_checks", run_business_logic_checks)
     orchestrator.register_runner("evidence_verification", run_evidence_verification)
     orchestrator.register_runner("consolidated_reporting", run_consolidated_reporting)
 
 
+def _check_preflight_assets(settings: dict[str, Any], profile: str) -> dict[str, Any]:
+    """Verify wordlist, Chromium/Playwright, and Nuclei templates before scanning."""
+    wordlist_raw = str(settings.get("wordlists", {}).get("directories", "")).strip()
+    wordlist_path = Path(wordlist_raw).expanduser() if wordlist_raw else None
+    wordlist_words = 0
+    if wordlist_path and wordlist_path.is_file():
+        try:
+            wordlist_words = sum(
+                1
+                for line in wordlist_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+        except OSError:
+            wordlist_words = 0
+    wordlist_ok = bool(wordlist_path and wordlist_path.is_file() and wordlist_words > 0)
+
+    configured_tpl = str(settings.get("nuclei", {}).get("templates_dir", "")).strip()
+    template_candidates = (
+        [Path(configured_tpl).expanduser()]
+        if configured_tpl
+        else [
+            Path.home() / "nuclei-templates",
+            Path.home() / ".local" / "nuclei-templates",
+            Path("/root/nuclei-templates"),
+            Path("/usr/share/nuclei-templates"),
+        ]
+    )
+    resolved_tpl_dir = next(
+        (str(p) for p in template_candidates if p.is_dir() and any(p.iterdir())),
+        "",
+    )
+    nuclei_binary = shutil.which("nuclei") or ""
+    templates_ok = bool(nuclei_binary and resolved_tpl_dir)
+
+    playwright_installed = importlib.util.find_spec("playwright") is not None
+    chromium_binary = (
+        shutil.which("chromium")
+        or shutil.which("chromium-browser")
+        or shutil.which("google-chrome")
+        or ""
+    )
+    ms_playwright_cache = Path.home() / ".cache" / "ms-playwright"
+    playwright_chromium_cached = (
+        ms_playwright_cache.is_dir()
+        and any(p.name.startswith("chromium") for p in ms_playwright_cache.iterdir())
+    )
+    chromium_ok = bool(playwright_installed and (chromium_binary or playwright_chromium_cached))
+
+    checks = {
+        "wordlist": {
+            "ready": wordlist_ok,
+            "path": wordlist_raw,
+            "word_count": wordlist_words,
+        },
+        "chromium": {
+            "ready": chromium_ok,
+            "playwright_installed": playwright_installed,
+            "chromium_binary": chromium_binary,
+            "playwright_cache_found": playwright_chromium_cached,
+        },
+        "nuclei_templates": {
+            "ready": templates_ok,
+            "nuclei_binary": nuclei_binary,
+            "templates_dir": resolved_tpl_dir,
+        },
+    }
+    required_keys = ["wordlist"]
+    if profile in {"browser-enabled", "full-scanner"}:
+        required_keys.append("chromium")
+    if profile == "full-scanner":
+        required_keys.append("nuclei_templates")
+
+    missing = [key for key in required_keys if not checks[key]["ready"]]
+    return {
+        "ready": len(missing) == 0,
+        "missing": missing,
+        "checks": checks,
+    }
+
+
 def run_doctor(profile: str = "core-only", settings_path: Path | None = None) -> dict[str, Any]:
     settings = load_settings(settings_path)
     report = DependencyManager().inspect_all(profile=profile)
+    preflight = _check_preflight_assets(settings, profile=profile)
     report["settings_valid"] = True
     report["resource_limits"] = settings["limits"]
+    report["preflight_assets"] = preflight["checks"]
+    if not preflight["ready"]:
+        report["ready"] = False
+        report["missing_preflight_assets"] = preflight["missing"]
     return report
 
 
@@ -191,9 +279,20 @@ def execute_scan(
     project_root: Path | None = None,
     output_root: str | None = None,
     baseline_scan_id: str | None = None,
+    preflight_profile: str | None = None,
     on_ready: Callable[[PipelineOrchestrator], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     try:
+        if preflight_profile:
+            doctor_report = run_doctor(profile=preflight_profile, settings_path=settings_path)
+            if not doctor_report.get("ready", False):
+                return 1, {
+                    "error": (
+                        f"Preflight check failed for profile {preflight_profile!r}; "
+                        "run 'quiver doctor --profile full-scanner' to inspect missing dependencies."
+                    ),
+                    "doctor": doctor_report,
+                }
         orchestrator = build_orchestrator(
             target=target,
             scope_path=scope_path,

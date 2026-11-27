@@ -272,7 +272,7 @@ class ReportBuilder:
         config_snapshot = self._read_optional_json("meta/config_snapshot.json")
         environment_snapshot = self._read_optional_json("meta/environment_snapshot.json")
         inventory = self._read_validated_json(
-            "redirect_analysis",
+            "api_js_intelligence",
             "inventory/unified_endpoints.json",
             allowed_stage_ids=("domain_enumeration", "browser_capture", "directory_discovery", "http_probing", "redirect_analysis", "api_js_intelligence"),
         )

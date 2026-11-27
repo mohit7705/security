@@ -558,7 +558,7 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                             err_msg[:300],
                         )
                         if ctx.progress_callback:
-                            ctx.progress_callback({"progress_percent": min(99, int(attempts / max(1, max_attempts) * 100)), "completed": attempts, "planned": max_attempts, "message": f"Navigation failed: {type(exc).__name__}; continuing within crawl budget"})
+                            ctx.progress_callback({"progress_percent": min(99, int(max(attempts / max(1, max_attempts), len(visited_pages) / max(1, max_pages)) * 100)), "completed": attempts, "planned": max_attempts, "message": f"Navigation failed: {type(exc).__name__}; continuing within crawl budget"})
                         continue
 
                     consecutive_failures = 0
@@ -643,7 +643,7 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                     visited_pages.append(visited_entry)
                     all_visited_pages.append(visited_entry)
                     if ctx.progress_callback:
-                        ctx.progress_callback({"progress_percent": min(99, int(attempts / max(1, max_attempts) * 100)), "completed": attempts, "planned": max_attempts, "message": f"Visited {len(visited_pages)} page(s); {len(queue)} queued"})
+                        ctx.progress_callback({"progress_percent": min(99, int(max(attempts / max(1, max_attempts), len(visited_pages) / max(1, max_pages)) * 100)), "completed": attempts, "planned": max_attempts, "message": f"Visited {len(visited_pages)} page(s); {len(queue)} queued"})
 
                     nav_endpoint = normalizer.normalize(
                         final_decision.normalized_url,

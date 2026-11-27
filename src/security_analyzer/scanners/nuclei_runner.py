@@ -147,7 +147,7 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
         ctx.coverage.record_skipped_check(stage_def.stage_id, "nuclei_resource_governor", reason)
         return _write_empty_result(ctx, stage_def, reason)
 
-    if ctx.scope_engine.policy.excluded_paths:
+    if ctx.scope_engine.policy.excluded_paths and not ctx.config.get("nuclei", {}).get("allow_with_excluded_paths", False):
         reason = (
             "Nuclei skipped: configured excluded paths cannot be enforced "
             "inside an HTTPS CONNECT tunnel"
@@ -179,9 +179,11 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
         return _write_empty_result(ctx, stage_def, reason)
 
     target_urls: list[str] = []
+    # Include all reachable, non-excluded endpoints across methods (GET, POST, etc.)
+    # so API and JS endpoints added by api_js_intelligence are scanned by Nuclei.
     candidates = [
         r for r in inventory.all_endpoints()
-        if r.method == "GET" and r.reachable is not False and not r.excluded
+        if r.reachable is not False and not r.excluded
     ]
     # One root URL per origin first: most templates are host-level, so this gives every
     # host coverage before individual paths consume the max_targets quota.

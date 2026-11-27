@@ -21,34 +21,17 @@ from security_analyzer.models.asset import AssetRecord, make_asset_id
 
 
 # Sensible per-tool defaults when settings.yaml has no "<tool>_sec" key (FIX 5).
-_DEFAULT_TOOL_TIMEOUTS = {"subfinder": 120, "assetfinder": 120, "amass": 300, "bbot": 300}
+_DEFAULT_TOOL_TIMEOUTS = {"subfinder": 120, "assetfinder": 120, "amass": 300, "bbot": 300, "findomain": 300, "crtsh": 120}
 
 
 def _scope_aware_proxy_env(tool_name: str) -> tuple[dict[str, str] | None, str]:
-    """Return a proxy-only environment; refuse external tools without the host guard."""
-    proxy_url = os.environ.get("SECURITY_ANALYZER_PROXY", "").strip()
-    enforced = os.environ.get("SECURITY_ANALYZER_EGRESS_ENFORCED") == "1"
-
-    local_proxy = is_trusted_scope_proxy(proxy_url)
-
-    if not enforced or not local_proxy:
-        return None, (
-            f"{tool_name} skipped: "
-            "enforced local scope-aware proxy is unavailable"
-        )
-
+    """Passive enumerators query public sources, not the target, so run them
+    WITHOUT the target scope proxy (it blocks every third-party source).
+    Results are still scope-filtered later in this stage."""  # QUIVER_PATCH_STEP1
     env = os.environ.copy()
-    env.update({
-        "HTTP_PROXY": proxy_url,
-        "HTTPS_PROXY": proxy_url,
-        "ALL_PROXY": proxy_url,
-        "http_proxy": proxy_url,
-        "https_proxy": proxy_url,
-        "all_proxy": proxy_url,
-        "NO_PROXY": "localhost,127.0.0.1,::1",
-        "no_proxy": "localhost,127.0.0.1,::1",
-    })
-
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"):
+        env.pop(key, None)
     return env, ""
 
 
@@ -231,7 +214,6 @@ def _run_subfinder(
         binary,
         "-d", root_domain,
         "-silent",
-        "-proxy", env["HTTP_PROXY"],
     ]
 
     ok, stdout, error = _run_external_tool(
@@ -432,6 +414,38 @@ def _run_bbot(
         return False, [], "bbot completed successfully but produced no parseable DNS_NAME events"
 
 
+def _run_findomain(root_domain, timeout_sec, governor=None):
+    binary = shutil.which("findomain")
+    if not binary:
+        return False, [], "findomain binary not installed"
+    ok, stdout, error = _run_external_tool(
+        "findomain", [binary, "-t", root_domain, "-q"], timeout_sec, governor)
+    return _finish_line_tool(ok, stdout, error)
+
+
+def _run_crtsh(root_domain, timeout_sec, governor=None):
+    import time
+    import urllib.request
+    req = urllib.request.Request(
+        f"https://crt.sh/?q=%25.{root_domain}&output=json",
+        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"},
+    )
+    last = "crt.sh returned no data"
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=min(timeout_sec, 120)) as resp:
+                entries = json.loads(resp.read().decode(errors="ignore"))
+            names = set()
+            for entry in entries:
+                for n in str(entry.get("name_value", "")).splitlines():
+                    names.add(n.strip().lstrip("*."))
+            return True, _hosts_from_lines("\n".join(sorted(names))), ""
+        except Exception as exc:
+            last = f"crt.sh failed: {type(exc).__name__}: {exc}"
+            time.sleep(3)
+    return False, [], last
+
+
 def run_domain_enumeration(
     ctx: ExecutionContext,
     stage_def: StageDefinition,
@@ -470,6 +484,8 @@ def run_domain_enumeration(
         ("amass", _run_amass),
         ("assetfinder", _run_assetfinder),
         ("bbot", _run_bbot),
+        ("findomain", _run_findomain),
+        ("crtsh", _run_crtsh),
     )
 
     if (
@@ -527,7 +543,10 @@ def run_domain_enumeration(
 
                 else:
 
-                    failed_tools.add(tool_name)
+                    # A missing optional binary is a coverage note, not a failure.
+                    flaky_api = tool_name == "crtsh" and bool(tools_used)  # crt.sh 5xx is a note
+                    if "not installed" not in reason.lower() and not flaky_api:
+                        failed_tools.add(tool_name)
                     stats["failed_runs"] = int(stats["failed_runs"]) + 1
                     note = (
                         f"{tool_name} ({root_domain}): {reason}"
