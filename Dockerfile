@@ -32,6 +32,7 @@ ARG GAU_VERSION=2.2.4
 ARG FEROXBUSTER_VERSION=2.11.0
 ARG AMASS_VERSION=4.2.0
 ARG TESTSSL_VERSION=v3.2.5
+ARG NUCLEI_TEMPLATES_REF=main
 ARG ASSETFINDER_VERSION=v0.1.1
 ARG WAYBACKURLS_VERSION=v0.1.0
 
@@ -98,6 +99,18 @@ RUN set -eux; \
     test -f /opt/testssl/testssl.sh; \
     rm -rf /opt/testssl/.git; \
     chmod 0755 /opt/testssl/testssl.sh
+
+# ------------------------------------------------------------
+# Download Nuclei templates at build time.
+# The runtime container has no direct internet access, so templates
+# must be baked into the image.
+# ------------------------------------------------------------
+
+RUN set -eux; \
+    git clone --depth 1 --branch "${NUCLEI_TEMPLATES_REF}" \
+      https://github.com/projectdiscovery/nuclei-templates.git /opt/nuclei-templates; \
+    rm -rf /opt/nuclei-templates/.git /opt/nuclei-templates/.github; \
+    test -n "$(find /opt/nuclei-templates -type f \( -name '*.yaml' -o -name '*.yml' \) -print -quit)"
 
 # ------------------------------------------------------------
 # Install BBOT in an isolated virtual environment
@@ -181,6 +194,7 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /opt/ms-playwright /opt/ms-playwright
 COPY --from=builder /opt/bbot-venv /opt/bbot-venv
 COPY --from=builder /opt/testssl /opt/testssl
+COPY --from=builder --chown=scanner:scanner /opt/nuclei-templates /opt/nuclei-templates
 
 COPY --from=builder /usr/local/bin/nuclei /usr/local/bin/nuclei
 COPY --from=builder /usr/local/bin/subfinder /usr/local/bin/subfinder
@@ -213,7 +227,7 @@ RUN ln -sf /usr/local/bin/httpx /usr/local/bin/httpx-toolkit && \
 
 WORKDIR /app
 
-RUN mkdir -p /home/scanner && ln -sfn /app/config/nuclei-templates /home/scanner/nuclei-templates && chown -h scanner:scanner /home/scanner/nuclei-templates
+RUN mkdir -p /home/scanner && chown scanner:scanner /home/scanner
 USER scanner
 
 VOLUME ["/app/output", "/app/secrets"]

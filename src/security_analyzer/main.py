@@ -238,7 +238,11 @@ def _check_preflight_assets(settings: dict[str, Any], profile: str) -> dict[str,
             "templates_dir": str(resolved_tpl) if resolved_tpl else "",
             "install_hint": (
                 "" if templates_ok
-                else "Install/update templates with: nuclei -update-templates "
+                else "Docker: rebuild the image (templates are baked into /opt/nuclei-templates): "
+                     "docker compose build --no-cache. "
+                     "Host install: nuclei -update-templates, or "
+                     "git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates "
+                     "config/nuclei-templates "
                      "(or set nuclei.templates_dir / NUCLEI_TEMPLATES_DIR)"
             ),
         },
