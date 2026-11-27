@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
@@ -51,6 +52,35 @@ def _detect_prometheus_metrics(response: requests.Response) -> list[str]:
     return ordered_unique
 
 
+VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
+
+
+def _origin_key(ep) -> tuple[str, str, int | None]:
+    return (ep.scheme, ep.hostname, getattr(ep, "port", None))
+
+
+def _select_endpoints(reachable: list, limit: int) -> list:
+    """/metrics first, then round-robin across origins (HTML/200 first) so one busy host
+    cannot consume the whole review quota."""
+    def is_metrics(ep) -> bool:
+        return (urlsplit(ep.canonical_url or ep.url).path or "").rstrip("/").endswith("/metrics")
+
+    def priority(ep) -> int:
+        ctype = (getattr(ep, "content_type", "") or "").lower()
+        return 0 if "html" in ctype else 1
+
+    selected = [ep for ep in reachable if is_metrics(ep)][:limit]
+    groups: dict[tuple, list] = {}
+    for ep in sorted((e for e in reachable if not is_metrics(e)), key=priority):
+        groups.setdefault(_origin_key(ep), []).append(ep)
+    queues = list(groups.values())
+    while len(selected) < limit and any(queues):
+        for queue in queues:
+            if queue and len(selected) < limit:
+                selected.append(queue.pop(0))
+    return selected
+
+
 def run_security_review(
     ctx: ExecutionContext,
     stage_def: StageDefinition,
@@ -83,16 +113,10 @@ def run_security_review(
             include_excluded=False,
         )
 
-    # Prioritize /metrics endpoints so Prometheus exposure checks are not dropped by max_endpoints
-    metrics_endpoints = [
-        ep for ep in reachable
-        if (urlsplit(ep.canonical_url or ep.url).path or "").rstrip("/").endswith("/metrics")
-    ]
-    other_endpoints = [
-        ep for ep in reachable
-        if not (urlsplit(ep.canonical_url or ep.url).path or "").rstrip("/").endswith("/metrics")
-    ]
-    selected = (metrics_endpoints + other_endpoints)[:max_endpoints]
+    selected = _select_endpoints(reachable, max_endpoints)
+    deadline = time.monotonic() + float(timeouts.get("security_review_stage_sec", 300))
+    oversize = 0
+    budget_stopped = False
 
     findings: list[dict[str, Any]] = []
     tested = 0
@@ -100,6 +124,10 @@ def run_security_review(
     notes: list[str] = []
 
     for endpoint in selected:
+        if time.monotonic() >= deadline:
+            notes.append("Header review stopped: stage time budget reached")
+            budget_stopped = True
+            break
         try:
             response = client.get(
                 endpoint.canonical_url or endpoint.url,
@@ -107,6 +135,12 @@ def run_security_review(
                 headers={"Origin": "https://untrusted-origin.example"},
             )
         except ResourceLimitExceeded as exc:
+            # Same exception type for one oversized body and for the scan-wide budget.
+            if "Response body" in str(exc):
+                oversize += 1
+                ctx.coverage.record_request_failure(stage_def.stage_id, endpoint.url, "ResponseTooLarge")
+                continue
+            budget_stopped = True
             notes.append(f"Header review stopped by scan-wide resource governor: {exc}")
             ctx.coverage.record_skipped_check(
                 stage_def.stage_id,
@@ -134,12 +168,17 @@ def run_security_review(
             for key, value in response.headers.items()
         }
 
+        is_html = "html" in (response.headers.get("Content-Type") or "").lower()
+        html_only = {"content-security-policy", "referrer-policy"}
+
         for header_name, severity, title in RECOMMENDED_HEADERS:
             if (
                 header_name == "strict-transport-security"
                 and endpoint.scheme != "https"
             ):
                 continue
+            if header_name in html_only and not is_html:
+                continue  # CSP/Referrer-Policy matter for documents, not JSON/images/assets
             if header_name not in lower_headers:
                 findings.append({
                     "category": f"missing_{header_name.replace('-', '_')}",
@@ -159,7 +198,8 @@ def run_security_review(
             "",
         ).lower()
         if (
-            "x-frame-options" not in lower_headers
+            is_html
+            and "x-frame-options" not in lower_headers
             and "frame-ancestors" not in csp
         ):
             findings.append({
@@ -211,8 +251,8 @@ def run_security_review(
             "x-powered-by",
             "x-aspnet-version",
         ):
-            value = lower_headers.get(header_name, "")
-            if value and any(char.isdigit() for char in value):
+            value = (response.headers.get(header_name) or "").strip()
+            if value and VERSION_RE.search(value):
                 findings.append({
                     "category": "technology_version_disclosure",
                     "severity": "INFO",
@@ -249,6 +289,7 @@ def run_security_review(
         "stage_id": stage_def.stage_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "endpoints_reviewed": tested,
+        "oversize_skipped": oversize,
         "findings": findings,
         "notes": notes,
     }
@@ -257,10 +298,14 @@ def run_security_review(
         payload,
     )
 
+    # The endpoint cap is a deliberate limit (noted above), not a failure.
     skipped = max(0, len(reachable) - tested)
+    attempted = tested + request_failures
+    fail_ratio = (request_failures / attempted) if attempted else 0.0
+    max_fail_ratio = float(limits.get("header_review_max_failure_ratio", 0.5))
     status = (
         StageStatus.PARTIAL
-        if not selected or tested == 0 or request_failures or notes or skipped
+        if not selected or tested == 0 or budget_stopped or fail_ratio > max_fail_ratio
         else StageStatus.SUCCESS
     )
     return StageResult(

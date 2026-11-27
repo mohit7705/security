@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import requests
 
 from security_analyzer.core.exceptions import ScopeViolationError
-from security_analyzer.intelligence.openapi_analyzer import ApiOperationRecord
+from security_analyzer.core.resource_governor import ResourceLimitExceeded
+from security_analyzer.intelligence.openapi_analyzer import ApiOperationRecord, is_oversize_error
 from security_analyzer.utils.http_client import ScopedHttpClient
 
 COMMON_GRAPHQL_PATHS: tuple[str, ...] = (
@@ -73,9 +75,20 @@ def _field_is_object(field: dict[str, Any], type_by_name: dict[str, dict[str, An
 class GraphQlAnalyzer:
     """Detects GraphQL endpoints, tests read-only introspection exposure, and extracts query/mutation operations."""
 
-    def __init__(self, client: ScopedHttpClient, stage_id: str = "api_js_intelligence") -> None:
+    def __init__(
+        self,
+        client: ScopedHttpClient,
+        stage_id: str = "api_js_intelligence",
+        *,
+        check_dns: bool = True,
+    ) -> None:
         self.client = client
         self.stage_id = stage_id
+        self.check_dns = check_dns
+        self.deadline: float | None = None
+        self.deadline_hit = False
+        self.budget_exhausted = False
+        self.oversize_skipped = 0
 
     def analyze(
         self,
@@ -86,7 +99,7 @@ class GraphQlAnalyzer:
         seen: set[str] = set()
 
         for u in candidate_graphql_urls or []:
-            if self.client.scope_engine.evaluate_url(u, check_dns=True).allowed and u not in seen:
+            if self.client.scope_engine.evaluate_url(u, check_dns=self.check_dns).allowed and u not in seen:
                 seen.add(u)
                 candidates.append(u)
 
@@ -97,7 +110,7 @@ class GraphQlAnalyzer:
             origin = f"{parsed.scheme}://{parsed.netloc}"
             for suffix in COMMON_GRAPHQL_PATHS:
                 full = urljoin(origin, suffix)
-                if self.client.scope_engine.evaluate_url(full, check_dns=True).allowed and full not in seen:
+                if self.client.scope_engine.evaluate_url(full, check_dns=self.check_dns).allowed and full not in seen:
                     seen.add(full)
                     candidates.append(full)
 
@@ -106,6 +119,9 @@ class GraphQlAnalyzer:
         findings: list[dict[str, Any]] = []
 
         for gql_url in candidates[:100]:
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                self.deadline_hit = True
+                break
             try:
                 probe = self.client.request(
                     "POST",
@@ -114,6 +130,12 @@ class GraphQlAnalyzer:
                     json_body=TYPENAME_QUERY,
                     headers={"Accept": "application/json"},
                 )
+            except ResourceLimitExceeded as exc:
+                if is_oversize_error(exc):
+                    self.oversize_skipped += 1
+                    continue
+                self.budget_exhausted = True
+                break
             except (ScopeViolationError, requests.RequestException):
                 continue
 
@@ -193,6 +215,12 @@ class GraphQlAnalyzer:
                         mutation_field_records = sorted(mutation_field_records, key=lambda item: item["name"])
                         query_fields = [item["name"] for item in query_field_records]
                         mutation_fields = [item["name"] for item in mutation_field_records]
+            except ResourceLimitExceeded as exc:
+                introspection_enabled = False
+                if is_oversize_error(exc):
+                    self.oversize_skipped += 1
+                else:
+                    self.budget_exhausted = True
             except Exception:
                 introspection_enabled = False
 

@@ -61,7 +61,9 @@ class ScopedBrowserManager:
         user_agent: str = "SecurityAnalyzer/0.1.0",
         lab_mode: bool = False,
         check_dns: bool = True,
+        block_resource_types: list[str] | tuple[str, ...] | None = None,
     ) -> None:
+        self.block_resource_types = {str(t).strip().lower() for t in (block_resource_types or ()) if str(t).strip()}
         self.scope_engine = scope_engine
         self.coverage = coverage
         self.stage_id = stage_id
@@ -184,6 +186,11 @@ class ScopedBrowserManager:
             route.continue_()
             return
 
+        # Optionally skip heavy, useless resources (fonts/media) before any budget or DNS work.
+        blocked_types = getattr(self, "block_resource_types", None)
+        if blocked_types and str(getattr(request, "resource_type", "")).lower() in blocked_types:
+            route.abort("blockedbyclient")
+            return
         decision = self.scope_engine.evaluate_url(
             url,
             check_dns=self.check_dns,

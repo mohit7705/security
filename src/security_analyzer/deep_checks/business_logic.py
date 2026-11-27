@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -21,6 +22,7 @@ from security_analyzer.deep_checks.response_diff import (
     ResponseFingerprint,
 )
 from security_analyzer.discovery.inventory_store import UnifiedEndpointInventory
+from security_analyzer.intelligence.openapi_analyzer import is_oversize_error
 from security_analyzer.models.asset import make_asset_id
 from security_analyzer.models.finding import FindingRecord, Severity, Verdict
 
@@ -28,6 +30,12 @@ PRIVILEGED_FIELD_RE = re.compile(
     r"(?i)^(?:role|roles|is[-_]?admin|admin|is[-_]?staff|superuser|"
     r"permissions|scopes|balance|credits?|price|amount|discount|tier|plan|"
     r"verified|email[-_]?verified|status)$"
+)
+# Names whose presence in a request schema is a real privilege/billing risk; the rest of
+# PRIVILEGED_FIELD_RE (status, price, amount, discount) is far noisier and is reported LOW.
+STRONG_PRIVILEGED_FIELD_RE = re.compile(
+    r"(?i)^(?:role|roles|is[-_]?admin|admin|is[-_]?staff|superuser|permissions|scopes|"
+    r"balance|credits?|tier|plan|verified|email[-_]?verified)$"
 )
 WORKFLOW_TERMINAL_STEP_RE = re.compile(
     r"(?i)/(?:confirm|complete|finalize|success|receipt|invoice|export|"
@@ -206,7 +214,9 @@ def _safe_endpoint_url(ctx: ExecutionContext, value: Any) -> str | None:
     if not isinstance(value, str) or not value or len(value) > 8192:
         return None
     try:
-        decision = ctx.scope_engine.evaluate_url(value, check_dns=True)
+        decision = ctx.scope_engine.evaluate_url(
+            value, check_dns=bool(ctx.config.get("scope", {}).get("check_dns", True))
+        )
     except (TypeError, ValueError):
         return None
     return decision.normalized_url if decision.allowed else None
@@ -260,6 +270,17 @@ def _append_finding(
     }
     if key not in existing:
         findings.append(finding.to_dict())
+
+
+def _endpoint_priority(endpoint) -> int:
+    """Pagination endpoints are the only ones that trigger requests: probe them first."""
+    try:
+        keys = {k.lower() for k, _ in parse_qsl(urlsplit(endpoint.url).query, keep_blank_values=True, max_num_fields=128)}
+    except ValueError:
+        return 2
+    if keys & PAGINATION_PARAM_NAMES:
+        return 0
+    return 1 if keys else 2
 
 
 def run_business_logic_checks(
@@ -353,6 +374,8 @@ def run_business_logic_checks(
         parsed_operation = urlsplit(operation_url)
         operation_id = str(operation.get("operation_id", ""))[:256]
         method = str(operation.get("method", "POST")).upper()[:16]
+        if method in {"GET", "HEAD", "OPTIONS"}:
+            continue  # no request body: a "status"/"price" query parameter is not mass assignment
         path = str(operation.get("path", parsed_operation.path))[:2048]
 
         workflows.append(
@@ -374,7 +397,11 @@ def run_business_logic_checks(
                     f"({method} {path})"
                 ),
                 category="mass_assignment_surface",
-                severity=Severity.MEDIUM,
+                severity=(
+                    Severity.MEDIUM
+                    if any(STRONG_PRIVILEGED_FIELD_RE.fullmatch(f) for f in sensitive_fields)
+                    else Severity.LOW
+                ),
                 verdict=Verdict.NEEDS_HUMAN_REVIEW,
                 confidence=0.72,
                 asset_id=make_asset_id(parsed_operation.hostname or "target"),
@@ -411,7 +438,12 @@ def run_business_logic_checks(
         and "{" not in urlsplit(endpoint.url).path
         and "}" not in urlsplit(endpoint.url).path
         and not DESTRUCTIVE_PATH_RE.search(endpoint.path)
-    ][:max_endpoints]
+    ]
+    eligible_total = len(endpoints)
+    endpoints = sorted(endpoints, key=_endpoint_priority)[:max_endpoints]
+    deadline = time.monotonic() + float(timeouts.get("logic_stage_sec", 300))
+    deadline_hit = False
+    oversize_skipped = 0
 
     workflow_models = _build_workflow_models(operations, endpoints)
     tested_count = 0
@@ -421,6 +453,9 @@ def run_business_logic_checks(
 
     for endpoint in endpoints:
         if budget_exhausted:
+            break
+        if time.monotonic() >= deadline:
+            deadline_hit = True
             break
 
         # Workflow terminal routes are only recorded as review surfaces.
@@ -506,7 +541,10 @@ def run_business_logic_checks(
                     stage_id=stage_def.stage_id,
                     allow_redirects=False,
                 )
-            except ResourceLimitExceeded:
+            except ResourceLimitExceeded as exc:
+                if is_oversize_error(exc):
+                    oversize_skipped += 1
+                    continue
                 budget_exhausted = True
                 break
             except (ScopeViolationError, requests.RequestException):
@@ -598,11 +636,19 @@ def run_business_logic_checks(
             budget_exhausted = True
 
     no_assessable_inputs = not endpoints
+    attempted = requests_sent + request_errors
+    fail_ratio = (request_errors / attempted) if attempted else 0.0
+    max_fail_ratio = float(ctx.config.get("limits", {}).get("deep_checks_max_failure_ratio", 0.5))
     status = (
         StageStatus.PARTIAL
-        if budget_exhausted or no_assessable_inputs or request_errors
+        if budget_exhausted or deadline_hit or no_assessable_inputs or fail_ratio > max_fail_ratio
         else StageStatus.SUCCESS
     )
+    if deadline_hit:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id, "logic_stage_budget",
+            f"business-logic checks stopped at the stage time budget ({tested_count}/{len(endpoints)} endpoints)",
+        )
     payload: dict[str, Any] = {
         "schema_version": "1.1",
         "scan_id": ctx.workspace.scan_id,
@@ -611,6 +657,9 @@ def run_business_logic_checks(
         "identity_used": active_identity,
         "summary": {
             "endpoints_total": len(endpoints),
+            "eligible_endpoints_total": eligible_total,
+            "oversize_skipped": oversize_skipped,
+            "deadline_hit": deadline_hit,
             "endpoints_evaluated": tested_count,
             "workflows_checked": len(workflows),
             "workflow_models": len(workflow_models),
@@ -640,6 +689,7 @@ def run_business_logic_checks(
             f"recorded {len(workflows)} workflow observation(s) and "
             f"{len(findings)} finding(s)"
             + ("; scan resource budget exhausted" if budget_exhausted else "")
+            + ("; stage time budget reached" if deadline_hit else "")
             + ("; no eligible endpoints were available for active assessment" if no_assessable_inputs else "")
             + (f"; {request_errors} request(s) failed" if request_errors else "")
         ),

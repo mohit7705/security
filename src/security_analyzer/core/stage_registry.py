@@ -104,7 +104,8 @@ STAGE_DEFINITIONS: tuple[StageDefinition, ...] = (
     ),
     StageDefinition(
         "http_probing", "HTTP Service Probing", "discovery",
-        dependencies=("domain_enumeration", "directory_discovery"),
+        dependencies=("domain_enumeration", "directory_discovery", "browser_capture"),
+        optional_dependencies=("browser_capture",),
         artifacts=(
             ArtifactSpec("discovery/http_probes.json", ("schema_version", "scan_id", "stage_id", "probes")),
             ArtifactSpec("inventory/contributions/http_probing.json", ("schema_version", "scan_id", "stage_id", "endpoints")),

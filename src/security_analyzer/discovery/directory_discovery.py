@@ -5,6 +5,8 @@ import ipaddress
 import json
 import os
 import shutil
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,13 @@ BUILTIN_COMMON_PATHS: tuple[str, ...] = (
     "dashboard",
     "config.json",
     "manifest.json",
+    ".git/HEAD",
+    ".env",
+    "actuator",
+    "actuator/health",
+    "api-docs",
+    "swagger/index.html",
+    "server-status",
 )
 
 STATIC_EXTENSIONS: tuple[str, ...] = (
@@ -111,7 +120,7 @@ def _load_wordlist(configured_path: str | None, max_entries: int) -> list[str]:
                 if len(words) >= max_entries:
                     break
             if words:
-                return words
+                return list(dict.fromkeys(words))  # drop duplicates, keep order
     return list(BUILTIN_COMMON_PATHS[:max_entries])
 
 
@@ -143,6 +152,7 @@ def _run_katana(
         "-c", str(concurrency),
         "-rl", str(rate),
         "-ct", f"{crawl_duration}s",
+        "-fs", "fqdn",  # stay on this host; otherwise every host re-crawls the whole root domain
         "-proxy", proxy_url,
         "-silent",
         "-nc",
@@ -154,11 +164,12 @@ def _run_katana(
             timeout_sec=timeout_sec,
             env=_proxy_env(proxy_url),
         )
+        tool_error = ""
         if proc.timed_out:
-            return [], f"katana exceeded its time budget ({timeout_sec}s)"
-        if proc.output_truncated:
-            return [], "katana output exceeded the configured process-output limit"
-        if proc.returncode != 0:
+            tool_error = f"katana exceeded its time budget ({timeout_sec}s); partial results kept"
+        elif proc.output_truncated:
+            tool_error = "katana output exceeded the configured process-output limit; partial results kept"
+        elif proc.returncode != 0:
             return [], f"katana exited with status {proc.returncode}"
 
         for raw_line in (proc.stdout or "").splitlines():
@@ -172,7 +183,7 @@ def _run_katana(
                 continue
             hits.append({
                 "url": decision.normalized_url,
-                "status_code": 200,
+                "status_code": None,  # katana output is URLs only: status is unverified, never assume 200
                 "content_length": 0,
                 "content_type": "",
                 "source": "katana",
@@ -181,7 +192,7 @@ def _run_katana(
         return hits, f"katana stopped by scan-wide resource budget ({timeout_sec}s)"
     except OSError as exc:
         return hits, f"katana could not run ({type(exc).__name__})"
-    return hits, ""
+    return hits, tool_error
 
 
 def _run_gau(
@@ -216,11 +227,12 @@ def _run_gau(
             env=_proxy_env(proxy_url),
             input_text="\n".join(root_domains) + "\n",
         )
+        tool_error = ""
         if proc.timed_out:
-            return [], f"gau exceeded its time budget ({timeout_sec}s)"
-        if proc.output_truncated:
-            return [], "gau output exceeded the configured process-output limit"
-        if proc.returncode != 0:
+            tool_error = f"gau exceeded its time budget ({timeout_sec}s); partial results kept"
+        elif proc.output_truncated:
+            tool_error = "gau output exceeded the configured process-output limit; partial results kept"
+        elif proc.returncode != 0:
             return [], f"gau exited with status {proc.returncode}"
 
         for raw_line in (proc.stdout or "").splitlines():
@@ -245,7 +257,7 @@ def _run_gau(
         return hits, f"gau stopped by scan-wide resource budget ({timeout_sec}s)"
     except OSError as exc:
         return hits, f"gau could not run ({type(exc).__name__})"
-    return hits, ""
+    return hits, tool_error
 
 
 def _run_waybackurls(
@@ -275,11 +287,12 @@ def _run_waybackurls(
             env=_proxy_env(proxy_url),
             input_text="\n".join(hosts) + "\n",
         )
+        tool_error = ""
         if proc.timed_out:
-            return [], f"waybackurls exceeded its time budget ({timeout_sec}s)"
-        if proc.output_truncated:
-            return [], "waybackurls output exceeded the configured process-output limit"
-        if proc.returncode != 0:
+            tool_error = f"waybackurls exceeded its time budget ({timeout_sec}s); partial results kept"
+        elif proc.output_truncated:
+            tool_error = "waybackurls output exceeded the configured process-output limit; partial results kept"
+        elif proc.returncode != 0:
             return [], f"waybackurls exited with status {proc.returncode}"
 
         for raw_line in (proc.stdout or "").splitlines():
@@ -304,7 +317,7 @@ def _run_waybackurls(
         return hits, f"waybackurls stopped by scan-wide resource budget ({timeout_sec}s)"
     except OSError as exc:
         return hits, f"waybackurls could not run ({type(exc).__name__})"
-    return hits, ""
+    return hits, tool_error
 
 
 def _run_feroxbuster(
@@ -362,11 +375,12 @@ def _run_feroxbuster(
             cwd=workspace.project_root,
             env=_proxy_env(proxy_url),
         )
+        tool_error = ""
         if proc.timed_out:
-            return [], f"feroxbuster exceeded its time budget ({timeout_sec}s)"
-        if proc.output_truncated:
-            return [], "feroxbuster output exceeded the configured process-output limit"
-        if proc.returncode != 0:
+            tool_error = f"feroxbuster exceeded its time budget ({timeout_sec}s); partial results kept"
+        elif proc.output_truncated:
+            tool_error = "feroxbuster output exceeded the configured process-output limit; partial results kept"
+        elif proc.returncode != 0:
             return [], f"feroxbuster exited with status {proc.returncode}"
 
         for line in (proc.stdout or "").splitlines():
@@ -395,7 +409,8 @@ def _run_feroxbuster(
                     "source": "feroxbuster",
                 })
 
-        if coverage is not None:
+        # Only claim coverage when the run was complete.
+        if coverage is not None and not tool_error:
             for word in allowed_words:
                 candidate = urljoin(base_url.rstrip("/") + "/", word)
                 decision = scope_engine.evaluate_url(candidate, check_dns=check_dns)
@@ -407,7 +422,7 @@ def _run_feroxbuster(
         return hits, f"feroxbuster could not run ({type(exc).__name__})"
     finally:
         wl_path.unlink(missing_ok=True)
-    return hits, ""
+    return hits, tool_error
 
 
 def _run_ffuf(
@@ -467,6 +482,7 @@ def _run_ffuf(
         "-json",
         "-s",
         "-noninteractive",
+        "-ac",  # auto-calibrate: filters wildcard / soft-404 responses (SPAs answer 200 to everything)
         "-t", str(threads),
         "-rate", str(rate),
     ]
@@ -477,11 +493,12 @@ def _run_ffuf(
             timeout_sec=timeout_sec,
             cwd=workspace.project_root,
         )
+        tool_error = ""
         if proc.timed_out:
-            return [], skipped, f"ffuf exceeded its time budget ({timeout_sec}s)"
-        if proc.output_truncated:
-            return [], skipped, "ffuf output exceeded the configured process-output limit"
-        if proc.returncode != 0:
+            tool_error = f"ffuf exceeded its time budget ({timeout_sec}s); partial results kept"
+        elif proc.output_truncated:
+            tool_error = "ffuf output exceeded the configured process-output limit; partial results kept"
+        elif proc.returncode != 0:
             return [], skipped, f"ffuf exited with status {proc.returncode}"
 
         for line in (proc.stdout or "").splitlines():
@@ -510,7 +527,7 @@ def _run_ffuf(
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
 
-        if coverage is not None:
+        if coverage is not None and not tool_error:
             for word in allowed_words:
                 candidate = urljoin(base_url.rstrip("/") + "/", word)
                 decision = scope_engine.evaluate_url(candidate, check_dns=check_dns)
@@ -523,7 +540,40 @@ def _run_ffuf(
     finally:
         wl_path.unlink(missing_ok=True)
 
-    return hits, skipped, ""
+    return hits, skipped, tool_error
+
+
+def _body_fingerprint(content: bytes | None) -> tuple[int, str]:
+    data = content or b""
+    return len(data), hashlib.sha1(data).hexdigest()[:16]
+
+
+def _probe_soft_404_baseline(client, base_url: str, stage_id: str, check_dns_decision) -> dict[str, Any] | None:
+    """Request a random, surely-nonexistent path. If it does not return 404/410, the site
+    answers every path (SPA / catch-all) and identical-looking hits are false positives."""
+    probe = urljoin(base_url.rstrip("/") + "/", f"sa-baseline-{uuid.uuid4().hex[:12]}")
+    decision = check_dns_decision(probe)
+    if not decision.allowed:
+        return None
+    try:
+        resp = client.get(decision.normalized_url, stage_id=stage_id)
+    except (ScopeViolationError, requests.RequestException, ResourceLimitExceeded):
+        return None
+    if resp.status_code in {404, 410}:
+        return None
+    length, digest = _body_fingerprint(resp.content)
+    return {"status": resp.status_code, "length": length, "digest": digest}
+
+
+def _is_soft_404(baseline: dict[str, Any] | None, status: int, content: bytes | None) -> bool:
+    if baseline is None or status != baseline["status"]:
+        return False
+    length, digest = _body_fingerprint(content)
+    if digest == baseline["digest"]:
+        return True
+    # Dynamic catch-all pages differ slightly (nonces, timestamps): compare size within 3%.
+    base_len = baseline["length"]
+    return base_len > 0 and abs(length - base_len) <= max(32, int(base_len * 0.03))
 
 
 def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -> StageResult:
@@ -533,10 +583,11 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
 
     limits = ctx.config.get("limits", {})
     timeouts = ctx.config.get("timeouts", {})
-    check_dns = bool(ctx.config.get("scope", {}).get("check_dns", False))
+    check_dns = bool(ctx.config.get("scope", {}).get("check_dns", True))
     max_paths = max(0, min(int(limits.get("max_directory_words", 250)), 10000))
     configured_wl = ctx.config.get("wordlists", {}).get("directories")
     words = _load_wordlist(configured_wl, max_paths)
+    stage_deadline = time.monotonic() + max(60, int(timeouts.get("directory_stage_sec", 1800)))
 
     inventory = UnifiedEndpointInventory(ctx.workspace)
     existing_inventory_urls: set[str] = {
@@ -589,6 +640,10 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
     max_concurrency = int(limits.get("max_concurrent_requests", 10))
 
     raw_hits: list[dict[str, Any]] = []
+    if configured_wl and not Path(str(configured_wl)).is_file():
+        partial_reasons.append(
+            f"Configured wordlist {configured_wl!r} was not found; only the small built-in path list was used"
+        )
 
     # Passive archive URL discovery (gau & waybackurls) when external egress proxy & governor are active
     non_loopback_hosts = [
@@ -614,7 +669,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
             if gau_hits:
                 tools_used.add("gau")
                 raw_hits.extend(gau_hits)
-            elif gau_err:
+            if gau_err:
                 ctx.coverage.record_skipped_check(stage_def.stage_id, "gau", gau_err)
 
         wb_hits, wb_err = _run_waybackurls(
@@ -631,7 +686,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
         if wb_hits:
             tools_used.add("waybackurls")
             raw_hits.extend(wb_hits)
-        elif wb_err:
+        if wb_err:
             ctx.coverage.record_skipped_check(stage_def.stage_id, "waybackurls", wb_err)
 
     known_urls_so_far: set[str] = set(existing_inventory_urls) | {
@@ -642,6 +697,14 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
     stop_all_hosts = False
 
     for host_entry in hosts:
+        if time.monotonic() >= stage_deadline:
+            partial_reasons.append(
+                "Directory stage time budget (timeouts.directory_stage_sec) exhausted; remaining hosts were not scanned"
+            )
+            ctx.coverage.record_skipped_check(
+                stage_def.stage_id, "directory_stage_budget", "stage time budget exhausted"
+            )
+            break
         remaining = max_stage_targets - processed_candidates
         if remaining <= 0:
             partial_reasons.append(
@@ -682,7 +745,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
                 tools_used.add("katana")
                 raw_hits.extend(katana_hits)
                 known_urls_so_far.update(item["url"] for item in katana_hits if item.get("url"))
-            elif katana_err:
+            if katana_err:
                 ctx.coverage.record_skipped_check(stage_def.stage_id, "katana", katana_err)
 
         # Deduplicate wordlist paths against URLs already in inventory or passive/crawler hits
@@ -752,6 +815,17 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
                 tools_used.add("ffuf")
                 tested_count += max(0, len(host_words) - skipped)
         else:
+            baseline = _probe_soft_404_baseline(
+                client,
+                base_url,
+                stage_def.stage_id,
+                lambda u: ctx.scope_engine.evaluate_url(u, check_dns=check_dns),
+            )
+            if baseline is not None:
+                partial_reasons.append(
+                    f"{base_url}: catch-all/soft-404 behaviour detected (random path returned HTTP "
+                    f"{baseline['status']}); matching responses were ignored"
+                )
             for word_index, word in enumerate(host_words):
                 candidate = urljoin(base_url.rstrip("/") + "/", word)
                 decision = ctx.scope_engine.evaluate_url(
@@ -797,6 +871,8 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
                     decision.normalized_url,
                     status_code=response.status_code,
                 )
+                if _is_soft_404(baseline, response.status_code, response.content):
+                    continue
                 if response.status_code in INTERESTING_STATUS_CODES:
                     raw_hits.append({
                         "url": decision.normalized_url,
@@ -824,6 +900,15 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
             skipped_count += 1
             continue
         inventory.upsert_endpoint(ep)
+        if ep.url in seen_urls:
+            # Same URL from several tools: keep the entry, but prefer one that has a verified status.
+            for existing in discovered_paths:
+                if existing["url"] == ep.url and existing["status_code"] is None and hit["status_code"] is not None:
+                    existing["status_code"] = hit["status_code"]
+                    existing["content_length"] = hit.get("content_length", 0)
+                    existing["content_type"] = hit.get("content_type", "")
+                    existing["source"] = hit["source"]
+                    break
         if ep.url not in seen_urls:
             seen_urls.add(ep.url)
             discovered_paths.append({

@@ -8,6 +8,7 @@ import shutil
 import socket
 import ssl
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -240,9 +241,10 @@ def _inspect_tls_endpoint(
     timeout_sec: float = 10.0,
     governor=None,
     proxy_url: str = "",
+    check_dns: bool = True,
 ) -> dict[str, Any]:
     """Inspect HTTPS through the local scope-aware CONNECT proxy."""
-    decision = scope_engine.evaluate_url(url, check_dns=True)
+    decision = scope_engine.evaluate_url(url, check_dns=check_dns)
     if not decision.allowed:
         raise ScopeViolationError(
             f"Scope violation for {url!r}: {decision.reason}"
@@ -332,10 +334,15 @@ def _inspect_tls_endpoint(
     except ssl.SSLCertVerificationError as exc:
         cert_valid = False
         cert_error = str(exc)[:300]
+        expired = "expired" in cert_error.lower()
         findings.append({
-            "category": "tls_certificate_invalid",
+            "category": "tls_certificate_expired" if expired else "tls_certificate_invalid",
             "severity": Severity.HIGH.value,
-            "title": "TLS certificate chain or hostname verification failed",
+            "title": (
+                "TLS certificate has expired"
+                if expired
+                else "TLS certificate chain or hostname verification failed"
+            ),
             "location": decision.normalized_url,
             "evidence": cert_error,
         })
@@ -439,7 +446,11 @@ def run_online_security_checks(
         ctx.config.get("limits", {}).get("max_urls_per_stage", 2500)
     )
 
+    check_dns = bool(ctx.config.get("scope", {}).get("check_dns", True))
+    max_testssl_origins = int(ctx.config.get("limits", {}).get("max_testssl_origins", 5))
+    stage_deadline = time.monotonic() + float(timeouts.get("tls_stage_sec", 1200))
     https_origins: dict[str, str] = {}
+    origin_alive: dict[str, bool] = {}
     for record in inventory.all_endpoints():
         if record.scheme != "https" or record.excluded:
             continue
@@ -450,11 +461,16 @@ def run_online_security_checks(
         if port != 443:
             origin += f":{port}"
         https_origins.setdefault(origin, origin + "/")
+        origin_alive[origin] = origin_alive.get(origin, False) or getattr(record, "reachable", None) is not False
         if len(https_origins) >= max_origins:
             break
+    # Do not spend handshakes/testssl on origins whose every endpoint was unreachable.
+    live_origins = {o: u for o, u in https_origins.items() if origin_alive.get(o)}
+    if live_origins:
+        https_origins = live_origins
 
     if not https_origins and urlsplit(ctx.target).scheme.lower() == "https":
-        decision = ctx.scope_engine.evaluate_url(ctx.target, check_dns=True)
+        decision = ctx.scope_engine.evaluate_url(ctx.target, check_dns=check_dns)
         if decision.allowed:
             parsed = urlsplit(decision.normalized_url)
             host = parsed.hostname or ""
@@ -562,8 +578,22 @@ def run_online_security_checks(
     notes: list[str] = []
     tested = 0
     testssl_used_any = False
+    testssl_runs = 0
+    handshake_failed = 0
+    budget_stopped = False
+    deadline_skipped = 0
+    target_host = (urlsplit(ctx.target).hostname or "").lower()
+    ordered_origins = sorted(
+        https_origins.values(),
+        key=lambda o: (0 if (urlsplit(o).hostname or "").lower() == target_host else 1, o),
+    )
 
-    for origin_url in sorted(https_origins.values()):
+    for idx, origin_url in enumerate(ordered_origins):
+        if time.monotonic() >= stage_deadline:
+            deadline_skipped = len(ordered_origins) - idx
+            notes.append(f"TLS checks stopped: stage time budget reached ({deadline_skipped} origin(s) not inspected)")
+            ctx.coverage.record_skipped_check(stage_def.stage_id, "tls_stage_budget", notes[-1])
+            break
         try:
             result = _inspect_tls_endpoint(
                 origin_url,
@@ -571,8 +601,23 @@ def run_online_security_checks(
                 timeout_sec=timeout_sec,
                 governor=ctx.resource_governor,
                 proxy_url=proxy_url,
+                check_dns=check_dns,
             )
-            if result["certificate_valid"] is not None:
+            legacy_vals = list(result.get("legacy_protocol_probe", {}).values())
+            if legacy_vals and all(v == "untestable" for v in legacy_vals):
+                ctx.coverage.record_skipped_check(
+                    stage_def.stage_id, "tls_legacy_probe",
+                    f"{origin_url}: legacy protocol probe untestable (local OpenSSL or network)",
+                )
+            if result["certificate_valid"] is not None and testssl_runs >= max_testssl_origins:
+                if testssl_runs == max_testssl_origins:
+                    ctx.coverage.record_skipped_check(
+                        stage_def.stage_id, "testssl.sh",
+                        f"testssl.sh limited to {max_testssl_origins} origin(s) (limits.max_testssl_origins)",
+                    )
+                    testssl_runs += 1
+            elif result["certificate_valid"] is not None:
+                testssl_runs += 1
                 existing_cats = {f["category"] for f in result["findings"]}
                 testssl_findings, testssl_ok, testssl_err = _run_testssl(
                     origin_url,
@@ -593,6 +638,7 @@ def run_online_security_checks(
             results.append(result)
             all_findings.extend(result["findings"])
             if result["certificate_valid"] is None:
+                handshake_failed += 1
                 notes.append(
                     f"{origin_url}: {result['certificate_error'] or 'TLS handshake failed'}"
                 )
@@ -613,6 +659,8 @@ def run_online_security_checks(
                 )
         except ResourceLimitExceeded as exc:
             notes.append(f"TLS checks stopped by scan-wide resource governor: {exc}")
+            ctx.coverage.record_skipped_check(stage_def.stage_id, "tls_resource_budget", str(exc))
+            budget_stopped = True
             break
         except (ScopeViolationError, OSError, ValueError, ssl.SSLError, http.client.HTTPException) as exc:
             notes.append(f"{origin_url}: {type(exc).__name__}")
@@ -635,7 +683,15 @@ def run_online_security_checks(
     ctx.workspace.write_json_atomic("analysis/tls_posture.json", payload)
 
     skipped = max(0, len(https_origins) - tested)
-    status = StageStatus.PARTIAL if notes or skipped else StageStatus.SUCCESS
+    # Dead hosts from historical URLs are normal; only a high failure ratio or a truncated run is PARTIAL.
+    attempted = tested + handshake_failed
+    fail_ratio = (handshake_failed / attempted) if attempted else 0.0
+    max_fail_ratio = float(ctx.config.get("limits", {}).get("tls_max_failure_ratio", 0.5))
+    status = (
+        StageStatus.PARTIAL
+        if tested == 0 or budget_stopped or deadline_skipped or fail_ratio > max_fail_ratio
+        else StageStatus.SUCCESS
+    )
     return StageResult(
         stage_id=stage_def.stage_id,
         status=status,

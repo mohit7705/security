@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
@@ -300,15 +301,33 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
         # Lab mode still pins and validates every browser destination against DNS.
         check_dns = True
     viewport = browser_cfg.get("viewport", {})
+    # Crawl budgets: failed navigations also count, so a slow/blocking site can't loop for hours.
+    max_attempts = int(browser_cfg.get("max_attempts", max_pages * 2))
+    max_crawl_sec = int(browser_cfg.get("max_crawl_sec_per_identity", 600))
+    max_stage_sec = int(browser_cfg.get("max_stage_sec", 1800))
+    max_consecutive_failures = int(browser_cfg.get("max_consecutive_failures", 5))
+    max_query_variants = int(browser_cfg.get("max_query_variants_per_path", 3))
+    max_seed_hosts = int(browser_cfg.get("max_seed_hosts", 10))
+    block_resource_types = list(browser_cfg.get("block_resource_types", ["media", "font"]))
+    stage_deadline = time.monotonic() + max(60, max_stage_sec)
 
     if max_pages < 1 or max_depth < 0 or nav_timeout_ms < 1000 or settle_wait_ms < 0:
         raise ValueError("Invalid browser limits: max_pages, max_depth, navigation_timeout_ms or settle_wait_ms")
 
     subdomains_art = ctx.upstream_artifacts["domain_enumeration"]["discovery/subdomains.json"]
     seed_urls: list[str] = [ctx.target]
+    seed_scheme = urlsplit(ctx.target).scheme.lower() or "https"
     for host_entry in subdomains_art.get("hosts", []):
         raw_url = str(host_entry.get("url", "")).strip()
-        if raw_url and raw_url not in seed_urls:
+        if not raw_url:
+            # Step 1 assets carry "hostname"/"ports", never "url".
+            hostname = str(host_entry.get("hostname", "")).strip()
+            if hostname:
+                ports = host_entry.get("ports") or []
+                port = ports[0] if ports else None
+                port_part = f":{port}" if port and int(port) not in (80, 443) else ""
+                raw_url = f"{seed_scheme}://{hostname}{port_part}/"
+        if raw_url and raw_url not in seed_urls and len(seed_urls) < max_seed_hosts:
             seed_urls.append(raw_url)
 
     inventory = UnifiedEndpointInventory(ctx.workspace)
@@ -360,6 +379,22 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
         )
 
     for identity_id, identity_context, profile in identity_contexts:
+        if time.monotonic() >= stage_deadline:
+            skipped_identities += 1
+            reason = "Browser stage time budget (browser.max_stage_sec) exhausted before this identity ran"
+            ctx.coverage.record_skipped_check(stage_def.stage_id, f"identity:{identity_id}", reason)
+            identity_results.append(
+                {
+                    "identity_id": identity_id,
+                    "role": str(getattr(identity_context, "role", "")),
+                    "authenticated": bool(getattr(identity_context, "authenticated", False)),
+                    "status": StageStatus.SKIPPED.value,
+                    "reason": reason,
+                    "visited_pages": 0,
+                    "navigation_errors": 0,
+                }
+            )
+            continue
         is_anonymous = identity_id == "anonymous"
         authenticated = bool(
             identity_context is not None
@@ -441,6 +476,10 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
         budget_blocked_count = 0
         browser_error = ""
         captured_session_storage: dict[str, dict[str, str]] = {}
+        attempts = 0
+        consecutive_failures = 0
+        stop_reason = "queue_empty"
+        path_variants: dict[tuple[str, str], int] = {}
 
         try:
             with ScopedBrowserManager(
@@ -458,14 +497,27 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                 user_agent=user_agent,
                 lab_mode=egress.mode == "lab",
                 check_dns=check_dns,
+                block_resource_types=block_resource_types,
                 viewport_width=int(viewport.get("width", 1366)),
                 viewport_height=int(viewport.get("height", 768)),
             ) as manager:
                 page = manager.new_page(timeout_ms=nav_timeout_ms)
                 net_capture.attach(page)
                 console_monitor.attach(page)
+                crawl_deadline = min(
+                    time.monotonic() + max(30, max_crawl_sec), stage_deadline
+                )
 
                 while queue and len(visited_pages) < max_pages:
+                    if attempts >= max_attempts:
+                        stop_reason = "attempt_limit"
+                        break
+                    if time.monotonic() >= crawl_deadline:
+                        stop_reason = "time_limit"
+                        break
+                    if consecutive_failures >= max_consecutive_failures:
+                        stop_reason = "consecutive_failures"
+                        break
                     target_url, depth = queue.popleft()
                     decision = ctx.scope_engine.evaluate_url(
                         target_url,
@@ -479,6 +531,7 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                         )
                         continue
 
+                    attempts += 1
                     try:
                         response = page.goto(
                             decision.normalized_url,
@@ -487,6 +540,7 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                         )
                         page.wait_for_timeout(settle_wait_ms)
                     except Exception as exc:
+                        consecutive_failures += 1
                         err_msg = f"{type(exc).__name__}: {exc}"
                         navigation_errors.append(
                             {
@@ -501,6 +555,7 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                         )
                         continue
 
+                    consecutive_failures = 0
                     final_url = str(page.url or decision.normalized_url)
                     final_decision = ctx.scope_engine.evaluate_url(
                         final_url,
@@ -532,6 +587,18 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                         page_title = str(page.title() or "")[:200]
                     except Exception:
                         page_title = ""
+
+                    # Extract links/forms BEFORE the screenshot: the PII-masking script rewrites
+                    # attributes (e.g. hrefs containing long numbers) and would corrupt them.
+                    extracted = None
+                    extract_error = ""
+                    try:
+                        extracted = route_discovery.extract_from_page(
+                            page,
+                            final_decision.normalized_url,
+                        )
+                    except Exception as exc:
+                        extract_error = f"dom_extract:{type(exc).__name__}"
 
                     screenshot_ref = ""
                     if capture_screenshots:
@@ -586,16 +653,11 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                     if nav_endpoint is not None:
                         inventory.upsert_endpoint(nav_endpoint)
 
-                    try:
-                        extracted = route_discovery.extract_from_page(
-                            page,
-                            final_decision.normalized_url,
-                        )
-                    except Exception as exc:
+                    if extracted is None:
                         navigation_errors.append(
                             {
                                 "url": redact_url_query(final_decision.normalized_url)[0],
-                                "error": f"dom_extract:{type(exc).__name__}",
+                                "error": extract_error or "dom_extract:unknown",
                             }
                         )
                         continue
@@ -649,11 +711,19 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                                 link_decision.allowed
                                 and link_decision.normalized_url not in enqueued
                             ):
+                                link_parts = urlsplit(link_decision.normalized_url)
+                                variant_key = (link_parts.netloc, link_parts.path)
+                                # Crawl-trap guard: faceted/paginated URLs differing only by query.
+                                if path_variants.get(variant_key, 0) >= max_query_variants:
+                                    continue
+                                path_variants[variant_key] = path_variants.get(variant_key, 0) + 1
                                 enqueued.add(link_decision.normalized_url)
                                 queue.append(
                                     (link_decision.normalized_url, depth + 1)
                                 )
 
+                if queue and stop_reason == "queue_empty":
+                    stop_reason = "page_limit"
                 blocked_count = len(manager.blocked_requests)
                 budget_blocked_count = manager.budget_blocked_requests
 
@@ -771,6 +841,8 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                 "reason": browser_error,
                 "visited_pages": len(visited_pages),
                 "navigation_errors": len(navigation_errors),
+                "crawl_attempts": attempts,
+                "stop_reason": stop_reason,
                 "skipped_mutating_links": skipped_mutating_total,
                 "api_candidates": api_endpoints_discovered,
                 "blocked_out_of_scope_requests": blocked_count,

@@ -1,21 +1,27 @@
-
 from __future__ import annotations
 
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from security_analyzer.core.orchestrator import ExecutionContext
 from security_analyzer.core.egress import is_trusted_scope_proxy
 from security_analyzer.core.resource_governor import ResourceLimitExceeded
+from security_analyzer.core.scope_engine import _dns_delegated_to_proxy
 from security_analyzer.core.stage_registry import StageDefinition, StageResult, StageStatus
 from security_analyzer.discovery.endpoint_normalizer import normalize_endpoint
 from security_analyzer.discovery.inventory_store import UnifiedEndpointInventory
 from security_analyzer.models.asset import AssetRecord, make_asset_id
+
+
+# Sensible per-tool defaults when settings.yaml has no "<tool>_sec" key (FIX 5).
+_DEFAULT_TOOL_TIMEOUTS = {"subfinder": 120, "assetfinder": 120, "amass": 300, "bbot": 300}
 
 
 def _scope_aware_proxy_env(tool_name: str) -> tuple[dict[str, str] | None, str]:
@@ -88,13 +94,15 @@ def _run_external_tool(
             f"{tool_name} execution failed: {type(exc).__name__}",
         )
 
+    # Keep whatever the tool printed before it was stopped, so callers can
+    # salvage partial results (FIX 4).
     if proc.timed_out:
-        return False, "", f"{tool_name} timed out after {timeout_sec}s"
+        return False, proc.stdout or "", f"{tool_name} timed out after {timeout_sec}s"
 
     if proc.output_truncated:
         return (
             False,
-            "",
+            proc.stdout or "",
             f"{tool_name} output exceeded the configured process-output limit",
         )
 
@@ -146,6 +154,41 @@ def _normalize_discovered_host(value: object) -> str | None:
     return candidate
 
 
+def _hosts_from_lines(stdout: str) -> list[str]:
+    """Parse one-host-per-line tool output (first token of each line)."""
+    found: set[str] = set()
+    for line in stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        host = _normalize_discovered_host(parts[0])
+        if host:
+            found.add(host)
+    return sorted(found)
+
+
+def _finish_line_tool(ok: bool, stdout: str, error: str) -> tuple[bool, list[str], str]:
+    """Return hosts; on timeout/truncation keep partial hosts as a warning."""
+    hosts = _hosts_from_lines(stdout) if stdout else []
+    if ok:
+        return True, hosts, ""
+    if hosts:
+        return True, hosts, f"partial results kept: {error}"
+    return False, [], error
+
+
+@lru_cache(maxsize=1)
+def _amass_supports_legacy_flags(binary: str) -> bool:
+    """True for amass v3 (-passive/-json); False for v4+ where they were removed."""
+    try:
+        out = subprocess.run(
+            [binary, "enum", "-h"], capture_output=True, text=True, timeout=15, check=False,
+        )
+        return "-passive" in (out.stdout + out.stderr)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _run_subfinder(
     root_domain: str,
     timeout_sec: int,
@@ -183,16 +226,7 @@ def _run_subfinder(
         governor,
     )
 
-    if not ok:
-        return False, [], error
-
-    found = sorted({
-        host
-        for line in stdout.splitlines()
-        if (host := _normalize_discovered_host(line))
-    })
-
-    return True, found, ""
+    return _finish_line_tool(ok, stdout, error)
 
 
 def _run_assetfinder(
@@ -219,16 +253,7 @@ def _run_assetfinder(
         governor,
     )
 
-    if not ok:
-        return False, [], error
-
-    found = sorted({
-        host
-        for line in stdout.splitlines()
-        if (host := _normalize_discovered_host(line))
-    })
-
-    return True, found, ""
+    return _finish_line_tool(ok, stdout, error)
 
 
 def _run_amass(
@@ -242,77 +267,62 @@ def _run_amass(
     if not binary:
         return False, [], "amass binary not installed"
 
-    # Passive mode avoids active DNS brute forcing and direct target probing.
+    legacy = _amass_supports_legacy_flags(binary)
+
     with tempfile.TemporaryDirectory(
         prefix="security-analyzer-amass-"
     ) as temp_dir:
 
-        output_path = Path(temp_dir) / "amass.json"
+        if legacy:
+            # amass v3: passive mode + JSON file output.
+            output_path = Path(temp_dir) / "amass.json"
+            command = [binary, "enum", "-passive", "-d", root_domain,
+                       "-json", str(output_path)]
+        else:
+            # amass v4: no -passive/-json. Results go to a local DB (-dir);
+            # -timeout is in MINUTES. Names are printed and also read back
+            # with `amass subs -names`.
+            output_path = None
+            command = [binary, "enum", "-d", root_domain, "-dir", temp_dir,
+                       "-nocolor", "-timeout", str(max(1, int(timeout_sec) // 60))]
 
-        command = [
-            binary,
-            "enum",
-            "-passive",
-            "-d", root_domain,
-            "-json", str(output_path),
-        ]
+        ok, stdout, error = _run_external_tool("amass", command, timeout_sec, governor)
 
-        ok, _stdout, error = _run_external_tool(
-            "amass",
-            command,
-            timeout_sec,
-            governor,
-        )
+        found: set[str] = set(_hosts_from_lines(stdout)) if not legacy else set()
 
+        if legacy and output_path is not None and output_path.is_file():
+            try:
+                raw = output_path.read_text(encoding="utf-8", errors="replace")
+                for line in raw.splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        host = _normalize_discovered_host(
+                            record.get("name") or record.get("domain"))
+                        if host:
+                            found.add(host)
+            except OSError:
+                pass
+
+        if not legacy and ok:
+            ok2, subs_out, _err2 = _run_external_tool(
+                "amass",
+                [binary, "subs", "-d", root_domain, "-names", "-dir", temp_dir, "-nocolor"],
+                min(60, int(timeout_sec)),
+                governor,
+            )
+            if ok2:
+                found.update(_hosts_from_lines(subs_out))
+
+        if found:
+            return True, sorted(found), ("" if ok else f"partial results kept: {error}")
         if not ok:
             return False, [], error
-
-        if not output_path.is_file():
-            return (
-                False,
-                [],
-                "amass completed without producing its JSON output file",
-            )
-
-        found: set[str] = set()
-
-        try:
-            raw = output_path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-
-            try:
-                parsed = json.loads(raw)
-                records = parsed if isinstance(parsed, list) else [parsed]
-
-            except json.JSONDecodeError:
-                records = [
-                    json.loads(line)
-                    for line in raw.splitlines()
-                    if line.strip()
-                ]
-
-            for record in records:
-
-                if isinstance(record, dict):
-
-                    host = _normalize_discovered_host(
-                        record.get("name")
-                        or record.get("domain")
-                    )
-
-                    if host:
-                        found.add(host)
-
-        except (OSError, json.JSONDecodeError):
-            return (
-                False,
-                [],
-                "amass produced unreadable JSON output",
-            )
-
-        return True, sorted(found), ""
+        return False, [], "amass completed but returned no hostnames"
 
 
 def _run_bbot(
@@ -348,32 +358,33 @@ def _run_bbot(
             governor,
         )
 
-        if not ok:
-            return False, [], error
-
         found: set[str] = set()
 
-        for line in stdout.splitlines():
+        def _collect(text: str) -> None:
+            for line in text.splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict) and event.get("type") == "DNS_NAME":
+                    host = _normalize_discovered_host(event.get("data"))
+                    if host:
+                        found.add(host)
 
+        # bbot writes events to <output dir>/<scan name>/output.json (or .ndjson);
+        # stdout only carries human-readable logs.
+        for out_file in Path(temp_dir).rglob("output.*json"):
             try:
-                event = json.loads(line)
-
-            except json.JSONDecodeError:
+                _collect(out_file.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
                 continue
+        _collect(stdout)
 
-            if (
-                isinstance(event, dict)
-                and event.get("type") == "DNS_NAME"
-            ):
-
-                host = _normalize_discovered_host(
-                    event.get("data")
-                )
-
-                if host:
-                    found.add(host)
-
-        return True, sorted(found), ""
+        if found:
+            return True, sorted(found), ("" if ok else f"partial results kept: {error}")
+        if not ok:
+            return False, [], error
+        return False, [], "bbot completed but returned no DNS_NAME events"
 
 
 def run_domain_enumeration(
@@ -426,7 +437,9 @@ def run_domain_enumeration(
                 timeout_sec = int(
                     timeout_cfg.get(
                         f"{tool_name}_sec",
-                        timeout_cfg.get("subfinder_sec", 120),
+                        _DEFAULT_TOOL_TIMEOUTS.get(
+                            tool_name, timeout_cfg.get("subfinder_sec", 120)
+                        ),
                     )
                 )
 
@@ -445,6 +458,9 @@ def run_domain_enumeration(
                             host,
                             set(),
                         ).add(tool_name)
+
+                    if reason:  # ok, but with a warning (partial results)
+                        notes.append(f"{tool_name} ({root_domain}): {reason}")
 
                 else:
 
@@ -524,7 +540,9 @@ def run_domain_enumeration(
 
         resolved_ips = list(decision.resolved_ips)
 
-        if not resolved_ips:
+        # In Docker the scanner has no DNS: the egress proxy resolves and validates IPs,
+        # so an empty IP list is expected there and must not drop every host.
+        if not resolved_ips and not _dns_delegated_to_proxy():
 
             ctx.coverage.record_out_of_scope(
                 stage_def.stage_id,
@@ -600,7 +618,7 @@ def run_domain_enumeration(
         "stage_id": stage_def.stage_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "seed_target": seed_url,
-        "subfinder_used": "subfinder" in tools_used,
+        "subfinder_used": "subfinder" in tools_used,  # legacy key, kept for compatibility
         "enumeration_tools_used": sorted(tools_used),
         "notes": notes,
         "hosts": [

@@ -14,7 +14,12 @@ from security_analyzer.authentication.identity_context import (
 )
 from security_analyzer.authentication.session_storage_bridge import SessionStorageBridge
 from security_analyzer.authentication.storage_state_store import StorageStateStore
-from security_analyzer.authentication.token_refresher import TokenRefresher, _extract_json_path
+from security_analyzer.authentication.token_refresher import (
+    TokenRefresher,
+    _cookie_http_only,
+    _cookie_same_site,
+    _extract_json_path,
+)
 from security_analyzer.core.coverage_tracker import CoverageTracker
 from security_analyzer.core.exceptions import ConfigurationError, ScopeViolationError
 from security_analyzer.core.scope_engine import ScopeEngine
@@ -131,6 +136,7 @@ class SessionManager:
                 ctx.session_storage_by_origin,
             )
 
+        ctx.status = "established" if ctx.authenticated else "login_failed"
         return ctx
 
     def _perform_api_login(
@@ -142,9 +148,14 @@ class SessionManager:
     ) -> None:
         if not profile.login_url:
             raise ConfigurationError(f"Identity {profile.identity_id!r} requires login_url for api_login")
-        if not profile.credentials or not any(profile.credentials.values()):
+        if not profile.credentials or not all(str(v).strip() for v in profile.credentials.values()):
             raise ConfigurationError(f"Identity {profile.identity_id!r} requires login credentials")
         login_url = self.scope_engine.enforce_url(profile.login_url, check_dns=True)
+        login_parts = urlsplit(login_url)
+        if login_parts.scheme != "https" and (login_parts.hostname or "").lower() not in {"localhost", "127.0.0.1", "::1"}:
+            raise ConfigurationError(
+                f"Identity {profile.identity_id!r}: refusing to send credentials over plain HTTP ({login_parts.hostname})"
+            )
         client = ctx.create_http_client(self.scope_engine, coverage=self.coverage)
 
         try:
@@ -182,8 +193,8 @@ class SessionManager:
                     "domain": cookie.domain or (urlsplit(login_url).hostname or ""),
                     "path": cookie.path or "/",
                     "secure": bool(cookie.secure),
-                    "httpOnly": bool(cookie.has_nonstandard_attr("HttpOnly")),
-                    "sameSite": "Lax",
+                    "httpOnly": _cookie_http_only(cookie),
+                    "sameSite": _cookie_same_site(cookie),
                 }
             )
 
@@ -209,7 +220,18 @@ class SessionManager:
                 "session_valid": ctx.session_valid,
             }
 
-        whoami_url = self.scope_engine.enforce_url(profile.whoami_url, check_dns=True)
+        try:
+            whoami_url = self.scope_engine.enforce_url(profile.whoami_url, check_dns=True)
+        except ScopeViolationError as exc:
+            ctx.session_valid = False
+            ctx.status = "out_of_scope"
+            return {
+                "identity_id": ctx.identity_id,
+                "checked": False,
+                "state": "out_of_scope",
+                "error": type(exc).__name__,
+                "session_valid": False,
+            }
         client = ctx.create_http_client(self.scope_engine, coverage=self.coverage, max_redirects=0)
 
         try:
@@ -309,18 +331,23 @@ class SessionManager:
 
         logout_url = logout_decision.normalized_url
         whoami_url = whoami_decision.normalized_url
-        client = ctx.create_http_client(self.scope_engine, coverage=self.coverage, max_redirects=0)
+        # Two independent clients built from the SAME pre-logout credentials: the logout
+        # response's Set-Cookie clears cookies only in the first client, so the replay
+        # client really tests whether the SERVER still accepts the old session.
+        logout_client = ctx.create_http_client(self.scope_engine, coverage=self.coverage, max_redirects=0)
+        replay_client = ctx.create_http_client(self.scope_engine, coverage=self.coverage, max_redirects=0)
 
         try:
-            logout_resp = client.request("POST", logout_url, stage_id=stage_id)
-            post_logout_check = client.get(whoami_url, stage_id=stage_id)
+            logout_resp = logout_client.request("POST", logout_url, stage_id=stage_id)
+            post_logout_check = replay_client.get(whoami_url, stage_id=stage_id)
         except (ScopeViolationError, requests.RequestException) as exc:
             return {"tested": True, "error": type(exc).__name__}
 
-        invalidated = post_logout_check.status_code in {401, 302, 303}
+        invalidated = post_logout_check.status_code in {401, 302, 303, 307, 308}
         return {
             "tested": True,
             "logout_status": logout_resp.status_code,
             "post_logout_whoami_status": post_logout_check.status_code,
             "server_invalidated_session": invalidated,
+            "old_session_still_accepted": post_logout_check.status_code in range(200, 300),
         }

@@ -117,7 +117,8 @@ class NetworkCapture:
 
     API_RESOURCE_TYPES = {"xhr", "fetch"}
 
-    def __init__(self) -> None:
+    def __init__(self, max_exchanges: int = 5000) -> None:
+        self.max_exchanges = max(1, int(max_exchanges))
         self._by_request_key: dict[int, CapturedExchange] = {}
         self._ordered: list[CapturedExchange] = []
         self._counter = 0
@@ -141,6 +142,8 @@ class NetworkCapture:
         if req_key in self._by_request_key:
             return
 
+        if len(self._ordered) >= self.max_exchanges:
+            return
         self._counter += 1
         sanitized_url, param_names = redact_url_query(url)
         raw_headers = dict(request.headers or {})

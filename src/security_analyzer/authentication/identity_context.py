@@ -38,13 +38,21 @@ class AuthMethod(str, Enum):
             raise ConfigurationError(f"Unsupported auth_method: {raw!r}") from exc
 
 
-def _expand_env_vars(value: Any) -> Any:
+def _expand_env_vars(value: Any, missing: set[str] | None = None) -> Any:
+    """Expand ${VAR}; names of unset/empty variables are collected in ``missing``."""
     if isinstance(value, str):
-        return _ENV_PATTERN.sub(lambda m: os.environ.get(m.group(1), ""), value)
+        def _sub(match: re.Match[str]) -> str:
+            resolved = os.environ.get(match.group(1))
+            if not resolved:
+                if missing is not None:
+                    missing.add(match.group(1))
+                return ""
+            return resolved
+        return _ENV_PATTERN.sub(_sub, value)
     if isinstance(value, list):
-        return [_expand_env_vars(item) for item in value]
+        return [_expand_env_vars(item, missing) for item in value]
     if isinstance(value, dict):
-        return {k: _expand_env_vars(v) for k, v in value.items()}
+        return {k: _expand_env_vars(v, missing) for k, v in value.items()}
     return value
 
 
@@ -166,15 +174,24 @@ class IdentityContext:
 
 def load_auth_profiles(auth_profiles_path: Path | None) -> tuple[dict[str, IdentityProfile], bool]:
     profiles = {"anonymous": IdentityProfile(identity_id="anonymous", role="anonymous", auth_method=AuthMethod.ANONYMOUS)}
-    if auth_profiles_path is None or not auth_profiles_path.exists():
+    if auth_profiles_path is None:
         return profiles, False
+    if not auth_profiles_path.is_file():
+        # A path was explicitly given: never silently fall back to anonymous-only.
+        raise ConfigurationError(f"Auth profiles file does not exist: {auth_profiles_path}")
     try:
         raw = yaml.safe_load(auth_profiles_path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as exc:
         raise ConfigurationError(f"Invalid auth profiles YAML: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigurationError("Auth profiles file must define a YAML mapping")
-    expanded = _expand_env_vars(raw)
+    missing_vars: set[str] = set()
+    expanded = _expand_env_vars(raw, missing_vars)
+    if missing_vars:
+        raise ConfigurationError(
+            "Auth profiles reference environment variables that are unset or empty: "
+            + ", ".join(sorted(missing_vars))
+        )
     identities = expanded.get("identities") or {}
     if not isinstance(identities, dict):
         raise ConfigurationError("identities in auth_profiles must be a mapping")

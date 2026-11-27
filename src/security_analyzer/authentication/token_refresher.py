@@ -35,6 +35,20 @@ def _extract_json_path(data: Any, dotted_path: str) -> str:
     return str(current).strip() if current is not None else ""
 
 
+def _cookie_http_only(cookie: Any) -> bool:
+    """Case-insensitive HttpOnly detection for a cookiejar cookie."""
+    return any(str(k).lower() == "httponly" for k in getattr(cookie, "_rest", {}))
+
+
+def _cookie_same_site(cookie: Any) -> str:
+    """Observed SameSite value, or "" when the server did not send one."""
+    for key, value in getattr(cookie, "_rest", {}).items():
+        if str(key).lower() == "samesite":
+            normalized = str(value or "").strip().lower()
+            return {"strict": "Strict", "lax": "Lax", "none": "None"}.get(normalized, "")
+    return ""
+
+
 def _b64url_decode_json(segment: str) -> dict[str, Any] | None:
     padded = segment + "=" * ((4 - len(segment) % 4) % 4)
     try:
@@ -137,8 +151,8 @@ def audit_jwt_token(
                 },
             ).to_dict()
         )
-    elif isinstance(exp_raw, (int, float)):
-        exp_ts = int(exp_raw)
+    elif isinstance(exp_raw, (int, float, str)) and str(exp_raw).replace(".", "", 1).isdigit():
+        exp_ts = int(float(exp_raw))
         if exp_ts < now_ts:
             findings.append(
                 FindingRecord(
@@ -164,7 +178,11 @@ def audit_jwt_token(
                     },
                 ).to_dict()
             )
-        elif isinstance(iat_raw, (int, float)) and (exp_ts - int(iat_raw)) > 30 * 86400:
+        elif (
+            not token_source.startswith("refresh")  # long-lived refresh tokens are normal
+            and isinstance(iat_raw, (int, float))
+            and (exp_ts - int(iat_raw)) > 30 * 86400
+        ):
             lifetime_days = round((exp_ts - int(iat_raw)) / 86400.0, 1)
             findings.append(
                 FindingRecord(
@@ -315,7 +333,7 @@ class TokenRefresher:
         except (ScopeViolationError, requests.RequestException) as exc:
             return RefreshOutcome(True, False, False, None, f"Refresh request failed: {type(exc).__name__}")
 
-        if resp.status_code not in {200, 201}:
+        if resp.status_code not in {200, 201, 204}:
             return RefreshOutcome(
                 True,
                 False,
@@ -346,8 +364,8 @@ class TokenRefresher:
                     "domain": cookie.domain or "",
                     "path": cookie.path or "/",
                     "secure": bool(cookie.secure),
-                    "httpOnly": bool(cookie.has_nonstandard_attr("HttpOnly")),
-                    "sameSite": "Lax",
+                    "httpOnly": _cookie_http_only(cookie),
+                    "sameSite": _cookie_same_site(cookie),
                 },
             )
         after_cookies = {

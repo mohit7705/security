@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 
 from security_analyzer.core.exceptions import ScopeViolationError
+from security_analyzer.core.resource_governor import ResourceLimitExceeded
+from security_analyzer.intelligence.openapi_analyzer import is_oversize_error
 from security_analyzer.utils.http_client import ScopedHttpClient
 
 SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
@@ -63,8 +66,15 @@ class JsBundleAnalyzer:
         stage_id: str = "api_js_intelligence",
         max_bundles: int = 30,
         max_bundle_bytes: int = 2_000_000,
+        check_dns: bool = True,
     ) -> None:
         self.client = client
+        self.check_dns = check_dns
+        self.deadline: float | None = None
+        self.deadline_hit = False
+        self.budget_exhausted = False
+        self.oversize_skipped = 0
+        self._scope_cache: dict[str, bool] = {}
         self.stage_id = stage_id
         self.max_bundles = max(1, min(int(max_bundles), 200))
         self.max_bundle_bytes = max(1024, min(int(max_bundle_bytes), 10_000_000))
@@ -77,10 +87,18 @@ class JsBundleAnalyzer:
     def _allowed(self, url: str) -> bool:
         if self._has_unresolved_template(url):
             return False
+        cached = self._scope_cache.get(url)
+        if cached is not None:
+            return cached
         try:
-            return self.client.scope_engine.evaluate_url(url, check_dns=True).allowed
+            ok = self.client.scope_engine.evaluate_url(url, check_dns=self.check_dns).allowed
         except (TypeError, ValueError):
-            return False
+            ok = False
+        self._scope_cache[url] = ok
+        return ok
+
+    def _expired(self) -> bool:
+        return self.deadline is not None and time.monotonic() >= self.deadline
 
     def discover_bundle_urls(self, html_page_urls: list[str], known_urls: list[str]) -> list[str]:
         bundles: list[str] = []
@@ -95,8 +113,17 @@ class JsBundleAnalyzer:
         for page_url in html_page_urls[:15]:
             if self._has_unresolved_template(page_url) or not self._allowed(page_url):
                 continue
+            if self._expired():
+                self.deadline_hit = True
+                break
             try:
                 resp = self.client.get(page_url, stage_id=self.stage_id)
+            except ResourceLimitExceeded as exc:
+                if is_oversize_error(exc):
+                    self.oversize_skipped += 1
+                    continue
+                self.budget_exhausted = True
+                break
             except (ScopeViolationError, requests.RequestException):
                 continue
             if resp.status_code != 200 or "html" not in resp.headers.get("Content-Type", "").lower():
@@ -121,8 +148,18 @@ class JsBundleAnalyzer:
         for js_url in bundle_urls[: self.max_bundles]:
             if self._has_unresolved_template(js_url) or not self._allowed(js_url):
                 continue
+            if self._expired():
+                self.deadline_hit = True
+                break
             try:
                 resp = self.client.get(js_url, stage_id=self.stage_id)
+            except ResourceLimitExceeded as exc:
+                # A bundle larger than the client's response cap used to crash the whole stage.
+                if is_oversize_error(exc):
+                    self.oversize_skipped += 1
+                    continue
+                self.budget_exhausted = True
+                break
             except (ScopeViolationError, requests.RequestException):
                 continue
 
@@ -138,9 +175,9 @@ class JsBundleAnalyzer:
             origin = f"{urlsplit(js_url).scheme}://{urlsplit(js_url).netloc}"
             local_routes: list[str] = []
             for rel_or_abs in API_PATH_RE.findall(code):
+                if len(local_routes) >= 500:
+                    break
                 candidate = rel_or_abs if rel_or_abs.startswith(("http://", "https://")) else urljoin(origin, rel_or_abs)
-                if not self.client.scope_engine.evaluate_url(candidate, check_dns=True).allowed:
-                    continue
                 if not self._allowed(candidate):
                     continue
                 if candidate not in local_routes:
@@ -235,6 +272,14 @@ class JsBundleAnalyzer:
                                     "sensitive implementation details or secrets."
                                 ),
                             })
+            except ResourceLimitExceeded as exc:
+                # Source maps are routinely larger than the response cap; that is not a stage failure.
+                source_map_exposed = False
+                source_map_content_exposed = False
+                if is_oversize_error(exc):
+                    self.oversize_skipped += 1
+                else:
+                    self.budget_exhausted = True
             except (ScopeViolationError, requests.RequestException, ValueError, UnicodeError):
                 source_map_exposed = False
                 source_map_content_exposed = False

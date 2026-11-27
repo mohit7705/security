@@ -1,4 +1,3 @@
-
 services:
   security-analyzer:
     build: &quiver-build
@@ -152,8 +151,7 @@ services:
   # It is not started by the default profile.
   juice-shop:
     image: bkimminich/juice-shop:v17.1.1
-    profiles:
-      - lab
+    profiles: ["lab"]
 
     container_name: quiver-juice-shop-lab
 

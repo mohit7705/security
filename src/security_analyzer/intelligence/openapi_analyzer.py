@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
@@ -10,6 +11,7 @@ import requests
 import yaml
 
 from security_analyzer.core.exceptions import ScopeViolationError
+from security_analyzer.core.resource_governor import ResourceLimitExceeded
 from security_analyzer.utils.http_client import ScopedHttpClient
 
 COMMON_SPEC_PATHS: tuple[str, ...] = (
@@ -57,18 +59,43 @@ class ApiOperationRecord:
         return asdict(self)
 
 
+def is_oversize_error(exc: Exception) -> bool:
+    """ResourceLimitExceeded is used for one oversized body AND for the scan-wide budget."""
+    return "Response body" in str(exc)
+
+
 class OpenApiAnalyzer:
     """Discovers and parses OpenAPI 3.x / Swagger 2.0 specifications into structured API operations."""
 
-    def __init__(self, client: ScopedHttpClient, stage_id: str = "api_js_intelligence") -> None:
+    def __init__(
+        self,
+        client: ScopedHttpClient,
+        stage_id: str = "api_js_intelligence",
+        *,
+        check_dns: bool = True,
+    ) -> None:
         self.client = client
         self.stage_id = stage_id
+        self.check_dns = check_dns
+        self.deadline: float | None = None
+        self.deadline_hit = False
+        self.budget_exhausted = False
+        self.oversize_skipped = 0
+        self._scope_cache: dict[str, bool] = {}
+
+    def _expired(self) -> bool:
+        return self.deadline is not None and time.monotonic() >= self.deadline
 
     def _allowed(self, url: str) -> bool:
+        cached = self._scope_cache.get(url)
+        if cached is not None:
+            return cached
         try:
-            return self.client.scope_engine.evaluate_url(url, check_dns=True).allowed
+            ok = self.client.scope_engine.evaluate_url(url, check_dns=self.check_dns).allowed
         except (TypeError, ValueError):
-            return False
+            ok = False
+        self._scope_cache[url] = ok
+        return ok
 
     @staticmethod
     def _parse_spec_document(raw_text: str, content_type: str) -> dict[str, Any] | None:
@@ -118,8 +145,17 @@ class OpenApiAnalyzer:
         findings: list[dict[str, Any]] = []
 
         for spec_url in candidates[:MAX_SPEC_CANDIDATES]:
+            if self._expired():
+                self.deadline_hit = True
+                break
             try:
                 resp = self.client.get(spec_url, stage_id=self.stage_id)
+            except ResourceLimitExceeded as exc:
+                if is_oversize_error(exc):
+                    self.oversize_skipped += 1
+                    continue
+                self.budget_exhausted = True
+                break
             except (ScopeViolationError, requests.RequestException):
                 continue
 
@@ -251,10 +287,6 @@ class OpenApiAnalyzer:
                     # Scope-check a concrete template substitution without contacting it.
                     scope_url = re.sub(r"\{[^{}]+\}", "1", op_url)
                     if not self._allowed(scope_url):
-                        continue
-                    if not self.client.scope_engine.evaluate_url(
-                        re.sub(r"\{[^{}]+\}", "1", op_url), check_dns=True
-                    ).allowed:
                         continue
 
                     op_security = op_obj.get("security")

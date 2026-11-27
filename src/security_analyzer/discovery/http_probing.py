@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import shutil
@@ -93,13 +96,30 @@ def _detect_technologies(headers: dict[str, str], body_sample: str) -> list[str]
         tech.add("Next.js")
     if "ng-version" in lower_body:
         tech.add("Angular")
-    if "data-reactroot" in lower_body or "react" in lower_body:
+    if "data-reactroot" in lower_body or "react-dom" in lower_body or "__react" in lower_body:
         tech.add("React")
-    if "swagger-ui" in lower_body or "openapi" in lower_body:
+    if "swagger-ui" in lower_body or "/openapi.json" in lower_body or "/swagger.json" in lower_body:
         tech.add("OpenAPI")
-    if "graphql" in lower_body:
+    if "/graphql" in lower_body or "graphql-playground" in lower_body:
         tech.add("GraphQL")
     return sorted(tech)
+
+
+def _is_projectdiscovery_httpx(binary: str, governor) -> bool:
+    """`httpx` on PATH is often the Python httpx CLI, which rejects `-l`/`-json`."""
+    if Path(binary).name == "httpx-toolkit":
+        return True
+    try:
+        proc = governor.run_process([binary, "-version"], timeout_sec=10)
+    except Exception:
+        return False
+    text = f"{proc.stdout}\n{proc.stderr}".lower()
+    return "projectdiscovery" in text or "current version" in text
+
+
+def _scaled_timeout(base_sec: int, url_count: int, rate: int) -> int:
+    needed = math.ceil(url_count / max(1, rate)) * 1.5 + 30
+    return int(min(max(base_sec, needed), 900))
 
 
 def _run_httpx_toolkit(
@@ -117,7 +137,11 @@ def _run_httpx_toolkit(
     if not urls:
         return {}, "No URLs available for httpx-toolkit"
 
+    if not _is_projectdiscovery_httpx(binary, governor):
+        return {}, "httpx binary on PATH is not ProjectDiscovery httpx (install httpx-toolkit)"
+
     rate = min(max(1, int(getattr(governor, "requests_per_host_per_sec", 5))), 25)
+    timeout_sec = _scaled_timeout(timeout_sec, len(urls), rate)
     with tempfile.TemporaryDirectory(prefix="security-analyzer-httpx-") as tmp_dir:
         targets_file = Path(tmp_dir) / "targets.txt"
         targets_file.write_text("\n".join(urls) + "\n", encoding="utf-8")
@@ -146,9 +170,11 @@ def _run_httpx_toolkit(
         except OSError as exc:
             return {}, f"httpx-toolkit could not run ({type(exc).__name__})"
 
+        note = ""
         if proc.timed_out:
-            return {}, f"httpx-toolkit exceeded its time budget ({timeout_sec}s)"
-        if proc.returncode != 0:
+            # Keep whatever was already emitted instead of discarding it.
+            note = f"httpx-toolkit exceeded its time budget ({timeout_sec}s); partial results kept"
+        elif proc.returncode != 0:
             return {}, f"httpx-toolkit exited with status {proc.returncode}"
 
         by_url: dict[str, dict[str, Any]] = {}
@@ -176,7 +202,7 @@ def _run_httpx_toolkit(
                 "technologies": sorted(set(techs)),
                 "location": str(obj.get("location", "")),
             }
-        return by_url, ""
+        return by_url, note
 
 
 def _run_whatweb(
@@ -269,8 +295,34 @@ def _run_nmap(
     )
 
 
+_GLOBAL_STOP = "global_budget"
+
+
+def _probe_one(client, ep, method: str, stage_id: str, deadline: float, stop: threading.Event):
+    """Network-only worker. All inventory/coverage writes stay on the main thread."""
+    if stop.is_set():
+        return ("budget", None, 0.0)
+    if time.monotonic() >= deadline:
+        return ("deadline", None, 0.0)
+    start = time.monotonic()
+    try:
+        resp = client.request(method, ep.url, stage_id=stage_id, allow_redirects=False)
+    except ResourceLimitExceeded as exc:
+        # The same exception type is raised for a single oversized response body
+        # and for the scan-wide budget; only the latter must stop the stage.
+        if "Response body" in str(exc):
+            return ("oversize", exc, 0.0)
+        stop.set()
+        return ("budget", exc, 0.0)
+    except ScopeViolationError as exc:
+        return ("scope", exc, 0.0)
+    except requests.RequestException as exc:
+        return ("error", exc, 0.0)
+    return ("ok", resp, round((time.monotonic() - start) * 1000.0, 2))
+
+
 def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> StageResult:
-    """Stage 04: Probes inventoried endpoints with strict TLS verification and single-pass deduplication."""
+    """Stage 05: Probes inventoried endpoints with strict TLS verification and single-pass deduplication."""
     inventory = UnifiedEndpointInventory(ctx.workspace)
     check_dns = bool(ctx.config.get("scope", {}).get("check_dns", False))
     normalizer = EndpointNormalizer(
@@ -291,11 +343,12 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         governor=ctx.resource_governor,
     )
 
-    raw_candidates = inventory.get_endpoints(include_excluded=False)[:max_urls]
+    raw_candidates = inventory.get_endpoints(include_excluded=False)
     candidates: list[Any] = []
     seen_probe_keys: set[tuple[str, str]] = set()
     dedup_skipped = 0
     unsafe_skipped = 0
+    cap_skipped = 0
     for ep in raw_candidates:
         probe_method = str(ep.method or "GET").upper()
         # Never turn a discovered write method into a GET request. That can
@@ -310,6 +363,9 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         if canonical_key in seen_probe_keys:
             dedup_skipped += 1
             continue
+        if len(candidates) >= max_urls:
+            cap_skipped += 1
+            continue
         seen_probe_keys.add(canonical_key)
         candidates.append(ep)
 
@@ -320,9 +376,17 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
             f"Skipped {unsafe_skipped} endpoint(s) matching the shared read-only request policy",
         )
 
+    if cap_skipped:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id, "max_urls_per_stage",
+            f"{cap_skipped} endpoint(s) beyond max_urls_per_stage={max_urls} were not probed",
+        )
+
     probe_records: list[dict[str, Any]] = []
     tested = 0
     failed = 0
+    oversize = 0
+    deadline_skipped = 0
     budget_exhausted = False
     tools_used: set[str] = set()
 
@@ -346,6 +410,11 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
     whatweb_map: dict[str, list[str]] = {}
     nmap_map: dict[str, list[dict[str, Any]]] = {}
 
+    if non_loopback_urls and not egress_enforced:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id, "external_probe_tools",
+            "httpx-toolkit/whatweb skipped: scoped egress proxy is not enforced",
+        )
     if egress_enforced and ctx.resource_governor is not None and non_loopback_urls:
         httpx_map, httpx_err = _run_httpx_toolkit(
             non_loopback_urls,
@@ -357,7 +426,7 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         )
         if httpx_map:
             tools_used.add("httpx-toolkit")
-        elif httpx_err:
+        if httpx_err:
             ctx.coverage.record_skipped_check(stage_def.stage_id, "httpx-toolkit", httpx_err)
 
         whatweb_map, whatweb_err = _run_whatweb(
@@ -385,30 +454,36 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         elif nmap_err:
             ctx.coverage.record_skipped_check(stage_def.stage_id, "nmap", nmap_err)
 
-    for idx, ep in enumerate(candidates):
-        method = ep.method if ep.method in {"GET", "HEAD", "OPTIONS"} else "GET"
-        start = time.monotonic()
-        try:
-            resp = client.request(
-                method,
-                ep.url,
-                stage_id=stage_def.stage_id,
-                allow_redirects=False,
-            )
-        except ResourceLimitExceeded as exc:
+    stage_budget = float(timeouts.get("http_probe_stage_sec", 900))
+    deadline = time.monotonic() + stage_budget
+    workers = max(1, min(int(getattr(ctx.resource_governor, "max_concurrent_requests", 4) or 4), 8))
+    stop = threading.Event()
+    plan = [(ep, ep.method if ep.method in {"GET", "HEAD", "OPTIONS"} else "GET") for ep in candidates]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="http-probe") as pool:
+        futures = [
+            pool.submit(_probe_one, client, ep, method, stage_def.stage_id, deadline, stop)
+            for ep, method in plan
+        ]
+        outcomes = [f.result() for f in futures]
+
+    for (ep, method), (kind, resp, elapsed_ms) in zip(plan, outcomes):
+        if kind == "budget":
             budget_exhausted = True
-            failed += len(candidates) - idx
-            ctx.coverage.record_skipped_check(
-                stage_def.stage_id, "http_resource_budget", str(exc)
-            )
-            break
-        except ScopeViolationError:
+            failed += 1
+            continue
+        if kind == "deadline":
+            deadline_skipped += 1
+            continue
+        if kind == "scope":
             ep.excluded = True
             ep.scope_status = "out_of_scope"
             inventory.upsert_endpoint(ep)
             continue
-        except requests.RequestException as exc:
-            failed += 1
+        if kind in {"error", "oversize"}:
+            if kind == "error":
+                failed += 1
+            else:
+                oversize += 1
             ep.reachable = False
             inventory.upsert_endpoint(ep)
             probe_records.append(
@@ -417,12 +492,11 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
                     "url": ep.url,
                     "method": method,
                     "reachable": False,
-                    "error": type(exc).__name__,
+                    "error": type(resp).__name__ if kind == "error" else "ResponseTooLarge",
                 }
             )
             continue
 
-        elapsed_ms = round((time.monotonic() - start) * 1000.0, 2)
         tested += 1
         ctx.coverage.record_target_tested(stage_def.stage_id, ep.url, status_code=resp.status_code)
         ctype = resp.headers.get("Content-Type", "")
@@ -431,7 +505,7 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
             if "text" in ctype.lower() or "json" in ctype.lower() or "html" in ctype.lower()
             else ""
         )
-        httpx_info = httpx_map.get(ep.url, {})
+        httpx_info = httpx_map.get(ep.url) or httpx_map.get(ep.canonical_url or "") or {}
         title = (_extract_title(text_preview) if "html" in ctype.lower() else "") or httpx_info.get("title", "")
         merged_tech = sorted(
             set(_detect_technologies(dict(resp.headers), text_preview))
@@ -479,6 +553,16 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
             }
         )
 
+    if budget_exhausted:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id, "http_resource_budget", "Scan-wide resource budget exhausted during probing"
+        )
+    if deadline_skipped:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id, "http_probe_stage_budget",
+            f"{deadline_skipped} endpoint(s) not probed: stage budget {int(stage_budget)}s reached",
+        )
+
     payload: dict[str, Any] = {
         "schema_version": "1.0",
         "scan_id": ctx.workspace.scan_id,
@@ -487,14 +571,21 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         "external_tools_used": sorted(tools_used),
         "deduplicated_skipped": dedup_skipped,
         "budget_exhausted": budget_exhausted,
+        "deadline_skipped": deadline_skipped,
+        "oversize_skipped": oversize,
         "probes": probe_records,
     }
     ctx.workspace.write_json_atomic("discovery/http_probes.json", payload)
     inventory.save(stage_id=stage_def.stage_id)
 
+    # Historical/wayback URLs routinely time out; a few dead URLs must not mark the
+    # whole stage PARTIAL. Only a high failure ratio or a truncated run does.
+    attempted = tested + failed
+    fail_ratio = (failed / attempted) if attempted else 0.0
+    max_fail_ratio = float(ctx.config.get("limits", {}).get("http_probe_max_failure_ratio", 0.5))
     status = (
         StageStatus.PARTIAL
-        if not candidates or tested == 0 or failed > 0 or budget_exhausted
+        if not candidates or tested == 0 or budget_exhausted or deadline_skipped > 0 or fail_ratio > max_fail_ratio
         else StageStatus.SUCCESS
     )
 
@@ -504,6 +595,8 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         summary=(
             f"Probed {tested} reachable endpoint(s), {failed} unreachable"
             + (f" ({dedup_skipped} duplicate URL(s) deduplicated)" if dedup_skipped else "")
+            + (f"; {deadline_skipped} not probed (stage time budget)" if deadline_skipped else "")
+            + (f"; {oversize} oversized response(s) skipped" if oversize else "")
             + (f"; {unsafe_skipped} destructive/non-read endpoint(s) skipped" if unsafe_skipped else "")
             + ("; scan resource budget exhausted" if budget_exhausted else "")
         ),
@@ -513,5 +606,8 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
             "targets_tested": tested,
             "targets_skipped": failed + unsafe_skipped + dedup_skipped,
             "destructive_or_non_read_skipped": unsafe_skipped,
+            "deadline_skipped": deadline_skipped,
+            "oversize_skipped": oversize,
+            "failure_ratio": round(fail_ratio, 3),
         },
     )

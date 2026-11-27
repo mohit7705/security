@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from security_analyzer.deep_checks.response_diff import (
     json_shape_similarity,
 )
 from security_analyzer.discovery.inventory_store import UnifiedEndpointInventory
+from security_analyzer.intelligence.openapi_analyzer import is_oversize_error
 from security_analyzer.models.asset import make_asset_id
 from security_analyzer.models.endpoint import EndpointRecord
 from security_analyzer.models.finding import FindingRecord, Severity, Verdict
@@ -182,6 +184,7 @@ def _response_is_same_protected_object(
         and owner_fp.is_json
         and other_fp.is_json
         and owner_fp.normalized_body_sha256 == other_fp.normalized_body_sha256
+        and owner_fp.content_length == other_fp.content_length
         and json_shape_similarity(owner_fp, other_fp) >= 0.80
     )
 
@@ -195,6 +198,20 @@ def _origin_root(url: str) -> str:
     return f"{parsed.scheme}://{netloc}/"
 
 
+def _prioritize_candidates(candidates, operations, auth_mgr, authenticated_ids):
+    """Spend the endpoint cap where authorization checks can actually conclude something:
+    owner-attributable routes first, then catalog-protected, then ID/admin-looking routes."""
+    def rank(endpoint) -> int:
+        if _resource_owner(auth_mgr, authenticated_ids, endpoint)[0]:
+            return 0
+        if _endpoint_declared_protected(operations, endpoint):
+            return 1
+        if _extract_resource_ids(endpoint.url) or ADMIN_PATH_RE.search(endpoint.path or ""):
+            return 2
+        return 3
+    return sorted(candidates, key=rank)  # stable: inventory order kept within a rank
+
+
 def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) -> StageResult:
     """Read-only, multi-identity authorization and IDOR/BOLA assessment.
 
@@ -204,6 +221,7 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
     """
     inventory = UnifiedEndpointInventory(ctx.workspace)
     auth_mgr = _get_or_init_auth_manager(ctx)
+    check_dns = bool(ctx.config.get("scope", {}).get("check_dns", True))
 
     deep_cfg = ctx.config.get("deep_checks", {})
     max_endpoints = min(500, max(1, int(deep_cfg.get("max_authz_endpoints", 60))))
@@ -220,6 +238,7 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
     if not isinstance(operations, list):
         operations = []
 
+    skipped_identities: list[str] = []
     clients: dict[str, Any] = {}
     for identity_id in auth_mgr.list_identities():
         try:
@@ -229,6 +248,11 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
         if identity_id != "anonymous" and not (
             identity.authenticated and identity.session_valid
         ):
+            skipped_identities.append(identity_id)
+            ctx.coverage.record_skipped_check(
+                stage_def.stage_id, "identity_session",
+                f"identity {identity_id!r} skipped: not authenticated or session invalid",
+            )
             continue
         try:
             clients[identity_id] = identity.create_http_client(
@@ -260,7 +284,12 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
         and "{" not in urlsplit(endpoint.url).path
         and "}" not in urlsplit(endpoint.url).path
         and endpoint.reachable is not False
-    ][:max_endpoints]
+    ]
+    candidates_total = len(candidates)
+    candidates = _prioritize_candidates(candidates, operations, auth_mgr, authenticated_ids)[:max_endpoints]
+    deadline = time.monotonic() + float(timeouts.get("authz_stage_sec", 600))
+    deadline_hit = False
+    oversize_skipped = 0
 
     matrix_tests: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
@@ -269,6 +298,9 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
     budget_exhausted = False
 
     for endpoint in candidates:
+        if time.monotonic() >= deadline:
+            deadline_hit = True
+            break
         fingerprints: dict[str, ResponseFingerprint] = {}
 
         for identity_id, client in clients.items():
@@ -279,7 +311,10 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
                     stage_id=stage_def.stage_id,
                     allow_redirects=False,
                 )
-            except ResourceLimitExceeded:
+            except ResourceLimitExceeded as exc:
+                if is_oversize_error(exc):
+                    oversize_skipped += 1
+                    continue
                 budget_exhausted = True
                 break
             except (ScopeViolationError, requests.RequestException):
@@ -404,8 +439,11 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
                         reproduced = _response_is_same_protected_object(
                             owner_fp, repeat_fp
                         )
-                    except ResourceLimitExceeded:
-                        budget_exhausted = True
+                    except ResourceLimitExceeded as exc:
+                        if is_oversize_error(exc):
+                            oversize_skipped += 1
+                        else:
+                            budget_exhausted = True
                     except (ScopeViolationError, requests.RequestException):
                         reproduced = False
                 same_object = reproduced
@@ -525,7 +563,7 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
             and authenticated_ids
         ):
             root_url = _origin_root(endpoint.url)
-            if ctx.scope_engine.evaluate_url(root_url, check_dns=True).allowed:
+            if ctx.scope_engine.evaluate_url(root_url, check_dns=check_dns).allowed:
                 expected_identity = next(
                     (
                         identity_id
@@ -547,7 +585,10 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
                                 headers={header_name: endpoint.path},
                                 allow_redirects=False,
                             )
-                        except ResourceLimitExceeded:
+                        except ResourceLimitExceeded as exc:
+                            if is_oversize_error(exc):
+                                oversize_skipped += 1
+                                continue
                             budget_exhausted = True
                             break
                         except (ScopeViolationError, requests.RequestException):
@@ -628,6 +669,7 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
     # are never executed. Responses are fingerprinted, not stored.
     graphql_field_checks: list[dict[str, Any]] = []
     graphql_incomplete = False
+    graphql_runtime_failure = False
     graphql_ops = [
         operation for operation in operations
         if isinstance(operation, dict)
@@ -669,7 +711,7 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
 
         gql_url = str(operation.get("url", ""))
         try:
-            decision = ctx.scope_engine.evaluate_url(gql_url, check_dns=True)
+            decision = ctx.scope_engine.evaluate_url(gql_url, check_dns=check_dns)
         except (TypeError, ValueError):
             continue
         if not decision.allowed:
@@ -688,11 +730,17 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
                     headers={"Accept": "application/json"},
                     allow_redirects=False,
                 )
-            except ResourceLimitExceeded:
+            except ResourceLimitExceeded as exc:
+                if is_oversize_error(exc):
+                    oversize_skipped += 1
+                    graphql_incomplete = True
+                    per_identity[identity_id] = {"request_error": True}
+                    continue
                 budget_exhausted = True
                 break
             except (ScopeViolationError, requests.RequestException):
                 request_errors += 1
+                graphql_runtime_failure = True
                 graphql_incomplete = True
                 per_identity[identity_id] = {"request_error": True}
                 continue
@@ -711,6 +759,7 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
                 valid_json = False
             if fingerprint.status_code >= 500 or not valid_json:
                 graphql_incomplete = True
+                graphql_runtime_failure = True
             data = response_json.get("data") if isinstance(response_json, dict) else None
             field_value = data.get(field_name) if isinstance(data, dict) else None
             errors = response_json.get("errors") if isinstance(response_json, dict) else None
@@ -746,14 +795,27 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
             break
 
     insufficient_identities = len(authenticated_ids) < 2
+    # GraphQL fields skipped *by design* (required args, mutation-looking names) are reported in the
+    # payload but do not degrade the stage; real request failures do.
+    attempted = tested_endpoints * max(1, len(clients)) + request_errors
+    fail_ratio = (request_errors / attempted) if attempted else 0.0
+    max_fail_ratio = float(ctx.config.get("limits", {}).get("deep_checks_max_failure_ratio", 0.5))
     status = (
         StageStatus.PARTIAL
-        if budget_exhausted or insufficient_identities or graphql_incomplete or request_errors
+        if budget_exhausted or deadline_hit or insufficient_identities
+        or graphql_runtime_failure or fail_ratio > max_fail_ratio
         else StageStatus.SUCCESS
     )
+    if deadline_hit:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id, "authz_stage_budget",
+            f"authorization checks stopped at the stage time budget ({tested_endpoints}/{len(candidates)} endpoints)",
+        )
     summary_suffix = (
         "fewer than two authenticated identities; horizontal IDOR coverage is incomplete"
         if insufficient_identities
+        else "stage time budget reached before all candidates were evaluated"
+        if deadline_hit
         else "scan resource budget exhausted before all candidates were evaluated"
         if budget_exhausted
         else "GraphQL field coverage is incomplete; required-argument fields or failed requests were skipped"
@@ -772,7 +834,11 @@ def run_authorization_idor(ctx: ExecutionContext, stage_def: StageDefinition) ->
         "authenticated_identities": authenticated_ids,
         "summary": {
             "endpoints_total": len(candidates),
+            "candidates_total": candidates_total,
             "endpoints_tested": tested_endpoints,
+            "oversize_skipped": oversize_skipped,
+            "deadline_hit": deadline_hit,
+            "skipped_identities": skipped_identities,
             "findings_count": len(findings),
             "horizontal_idor_attribution": "explicit_owned_resource_ids",
             "rewrite_header_probes_enabled": enable_rewrite_probes,

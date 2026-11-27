@@ -37,6 +37,16 @@ def _scrub_redirect_value(value: str) -> str:
     return _PII_BODY_RE.sub("[REDACTED_PII]", cleaned)
 
 
+_PATH_PII_RE = re.compile(
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*"
+)
+
+
+def _scrub_path(path: str) -> str:
+    """Redact emails/JWTs in a URL path; keep long numeric IDs (not phone numbers)."""
+    return _PATH_PII_RE.sub("[REDACTED_PII]", _SECRET_BODY_RE.sub(r"\1[REDACTED]", str(path)))
+
+
 def _scrub_url(raw_url: str) -> str:
     """Redact sensitive query values in absolute and relative redirect URLs."""
     try:
@@ -52,7 +62,7 @@ def _scrub_url(raw_url: str) -> str:
                 netloc += f":{parsed.port}"
         else:
             netloc = parsed.netloc
-        safe_path = _scrub_redirect_value(parsed.path)
+        safe_path = _scrub_path(parsed.path)
         redacted_q = urlencode(
             [
                 (k, "[REDACTED]" if _is_sensitive_name(k) else _scrub_redirect_value(v))
@@ -108,7 +118,7 @@ def _scrub_body_text(text: str, mime_type: str = "") -> str:
         return ""
     if "json" in mime_type.lower():
         try:
-            return json.dumps(_scrub_json_value(json.loads(text)), ensure_ascii=False)
+            return json.dumps(_scrub_json_value(json.loads(text)), ensure_ascii=False)[:65536]
         except (json.JSONDecodeError, TypeError):
             pass
     cleaned = _SECRET_BODY_RE.sub(r"\1[REDACTED]", text)
@@ -136,6 +146,23 @@ class HarRecorder:
         return self.sanitize_and_summarize()
 
     def sanitize_and_summarize(self) -> dict[str, Any]:
+        """Sanitize in place; if that is impossible, delete the raw HAR (never keep unscrubbed secrets)."""
+        try:
+            return self._sanitize_and_summarize()
+        except Exception as exc:
+            try:
+                self.har_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return {
+                "recorded": False,
+                "relative_path": self.relative_path,
+                "entries": 0,
+                "sha256": "",
+                "error": f"unsanitizable_har_removed:{type(exc).__name__}",
+            }
+
+    def _sanitize_and_summarize(self) -> dict[str, Any]:
         if not self.har_path.exists() or self.har_path.stat().st_size == 0:
             return {"recorded": False, "relative_path": self.relative_path, "entries": 0, "sha256": ""}
 

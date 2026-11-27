@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import shutil
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -70,8 +71,24 @@ _TAKEOVER_BODY_SIGNATURES: tuple[tuple[str, str], ...] = (
     ("Sorry, this shop is currently unavailable.", "Shopify"),
     ("Repository not found", "Bitbucket Pages"),
     ("Project doesnt exist... yet!", "Surge.sh"),
-    ("Do you want to register", "WordPress / SaaS"),
 )
+
+
+_CLOUD_STORAGE_PROVIDERS = {"aws s3", "aws s3 website", "microsoft azure blob storage"}
+
+
+def _banner_matches_cname(banner_provider: str, cname_provider: str) -> bool:
+    """A page-text signature only counts if it is consistent with the CNAME's provider."""
+    if not banner_provider:
+        return False
+    if not cname_provider:
+        return False
+    b, c = banner_provider.lower(), cname_provider.lower()
+    if b == c or b in c or c in b:
+        return True
+    if b == "cloud object storage" and c in _CLOUD_STORAGE_PROVIDERS:
+        return True
+    return bool(set(b.split()) & set(c.split()) - {"microsoft", "azure", "aws", "pages", "app", "service"})
 
 
 def _scope_url_for_host(hostname: str, scope_engine) -> str:
@@ -322,8 +339,26 @@ def run_server_dns_checks(
     whois_cache: dict[str, tuple[dict[str, Any], str]] = {}
     whois_used_any = False
     probe_snippets = _load_http_probe_snippets(ctx.workspace)
+    degraded = False
+    txt_cache: dict[str, tuple[list[str], str]] = {}
+    email_reported: set[str] = set()
+    txt_error_hosts = 0
+    deadline_skipped = 0
+    deadline = time.monotonic() + float(timeouts.get("dns_stage_sec", 600))
+
+    def _cached_txt(name: str) -> tuple[list[str], str]:
+        # Every subdomain shares its root domain's SPF/DMARC: query once, not once per host.
+        if name not in txt_cache:
+            txt_cache[name] = _query_txt_records(
+                name,
+                ctx.resource_governor,
+                scope_engine=ctx.scope_engine,
+                timeout_sec=float(timeouts.get("dns_sec", 8.0)),
+            )
+        return txt_cache[name]
 
     if not assets:
+        degraded = True
         notes.append("No inventoried assets were available for DNS checks")
     if whois_available:
         whois_transport_reason = (
@@ -335,7 +370,13 @@ def run_server_dns_checks(
             stage_def.stage_id, "whois_transport", whois_transport_reason
         )
 
-    for asset in selected_assets:
+    for idx, asset in enumerate(selected_assets):
+        if time.monotonic() >= deadline:
+            deadline_skipped = len(selected_assets) - idx
+            degraded = True
+            notes.append(f"DNS checks stopped: stage time budget reached ({deadline_skipped} asset(s) not checked)")
+            ctx.coverage.record_skipped_check(stage_def.stage_id, "dns_stage_budget", notes[-1])
+            break
         host = asset.hostname
         ips, resolve_error = _resolve_scoped_host(host, ctx.scope_engine)
         if resolve_error:
@@ -376,6 +417,9 @@ def run_server_dns_checks(
             if signature.lower() in host_snippet.lower():
                 matched_banner_provider = provider
                 break
+
+        if matched_banner_provider and not _banner_matches_cname(matched_banner_provider, takeover_provider):
+            matched_banner_provider = ""  # signature text on an unrelated provider is not evidence
 
         if cname_records and (resolve_error != "" or matched_banner_provider):
             provider_label = matched_banner_provider or takeover_provider or "external CNAME target"
@@ -443,21 +487,11 @@ def run_server_dns_checks(
         txt_errors: list[str] = []
 
         if dig_available and resolve_error == "":
-            txt_records, txt_error = _query_txt_records(
-                asset.root_domain or host,
-                ctx.resource_governor,
-                scope_engine=ctx.scope_engine,
-                timeout_sec=float(timeouts.get("dns_sec", 8.0)),
-            )
+            txt_records, txt_error = _cached_txt(asset.root_domain or host)
             if txt_error:
                 txt_errors.append(f"SPF TXT: {txt_error}")
 
-            dmarc_records, dmarc_error = _query_txt_records(
-                f"_dmarc.{asset.root_domain or host}",
-                ctx.resource_governor,
-                scope_engine=ctx.scope_engine,
-                timeout_sec=float(timeouts.get("dns_sec", 8.0)),
-            )
+            dmarc_records, dmarc_error = _cached_txt(f"_dmarc.{asset.root_domain or host}")
             if dmarc_error:
                 txt_errors.append(f"DMARC TXT: {dmarc_error}")
 
@@ -479,6 +513,37 @@ def run_server_dns_checks(
         has_spf = any("v=spf1" in record.lower() for record in txt_records)
         has_dmarc = any("v=dmarc1" in record.lower() for record in dmarc_records)
 
+        # SPF/DMARC were collected but never reported. Emit one observation per root domain.
+        mail_domain = (asset.root_domain or host).lower()
+        if dig_available and resolve_error == "" and not txt_errors and mail_domain not in email_reported:
+            email_reported.add(mail_domain)
+            for missing, category, severity, title, text in (
+                (not has_spf, "missing_spf_record", Severity.INFO,
+                 f"No SPF record published for {mail_domain}",
+                 "No TXT record beginning with v=spf1 was returned. If the domain sends or should never send email, publish an SPF policy."),
+                (not has_dmarc, "missing_dmarc_record", Severity.LOW,
+                 f"No DMARC record published for {mail_domain}",
+                 "No _dmarc TXT record with v=DMARC1 was returned, so receivers have no policy for spoofed mail."),
+            ):
+                if not missing:
+                    continue
+                findings.append(
+                    FindingRecord(
+                        title=title,
+                        category=category,
+                        severity=severity,
+                        verdict=Verdict.LIKELY,
+                        confidence=0.7,
+                        asset_id=make_asset_id(mail_domain),
+                        endpoint_id=f"dns_txt_{mail_domain}",
+                        identity_id="anonymous",
+                        description=text,
+                        remediation="Publish a SPF record and a DMARC policy (start with p=none and reporting, then enforce).",
+                        scanner_source="dns_infrastructure_scanner",
+                        metadata={"hostname": mail_domain, "url": f"https://{mail_domain}/"},
+                    ).to_dict()
+                )
+
         records.append({
             "hostname": host,
             "root_domain": asset.root_domain,
@@ -497,7 +562,10 @@ def run_server_dns_checks(
         })
 
         if txt_errors:
-            notes.extend(f"{host}: {error}" for error in txt_errors)
+            txt_error_hosts += 1
+            notes.extend(
+                m for m in (f"{asset.root_domain or host}: {error}" for error in txt_errors) if m not in notes
+            )
 
         if (
             "resource budget exhausted" in cname_error
@@ -506,16 +574,19 @@ def run_server_dns_checks(
         ):
             if "resource budget exhausted" in cname_error:
                 notes.append(f"{host}: CNAME: {cname_error}")
+            degraded = True
             break
 
     if not dig_available:
         reason = "dig is not installed; SPF/DMARC TXT checks were skipped"
         notes.append(reason)
         ctx.coverage.record_skipped_check(stage_def.stage_id, "dig", reason)
+        degraded = True
     elif ctx.resource_governor is None:
         reason = "shared ResourceGovernor unavailable; SPF/DMARC TXT checks were skipped"
         notes.append(reason)
         ctx.coverage.record_skipped_check(stage_def.stage_id, "dig_resource_governor", reason)
+        degraded = True
 
     if not whois_available:
         ctx.coverage.record_skipped_check(
@@ -546,7 +617,13 @@ def run_server_dns_checks(
     ctx.workspace.write_json_atomic("analysis/dns_infrastructure.json", payload)
 
     skipped = max(0, len(assets) - tested)
-    status = StageStatus.PARTIAL if notes or skipped else StageStatus.SUCCESS
+    # Dead subdomains and the (always skipped) WHOIS transport are expected, informational notes.
+    too_many_txt_errors = tested > 0 and txt_error_hosts > tested * 0.5
+    status = (
+        StageStatus.PARTIAL
+        if degraded or tested == 0 or too_many_txt_errors
+        else StageStatus.SUCCESS
+    )
     return StageResult(
         stage_id=stage_def.stage_id,
         status=status,
@@ -561,5 +638,7 @@ def run_server_dns_checks(
             "targets_total": len(assets),
             "targets_tested": tested,
             "targets_skipped": skipped,
+            "deadline_skipped": deadline_skipped,
+            "email_auth_domains_checked": len(email_reported),
         },
     )

@@ -156,6 +156,7 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
         return _write_empty_result(ctx, stage_def, reason)
 
     inventory = UnifiedEndpointInventory(ctx.workspace)
+    check_dns = bool(ctx.config.get("scope", {}).get("check_dns", True))
     nuclei_cfg = ctx.config.get("nuclei", {})
     limits = ctx.config.get("limits", {})
     max_targets = min(
@@ -178,11 +179,24 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
         return _write_empty_result(ctx, stage_def, reason)
 
     target_urls: list[str] = []
-    for record in inventory.all_endpoints():
-        if record.method != "GET" or record.reachable is False or record.excluded:
-            continue
-        raw_url = record.canonical_url or record.url
-        decision = ctx.scope_engine.evaluate_url(raw_url, check_dns=True)
+    candidates = [
+        r for r in inventory.all_endpoints()
+        if r.method == "GET" and r.reachable is not False and not r.excluded
+    ]
+    # One root URL per origin first: most templates are host-level, so this gives every
+    # host coverage before individual paths consume the max_targets quota.
+    ordered_urls: list[str] = []
+    seen_origins: set[str] = set()
+    for r in candidates:
+        parsed_c = urlsplit(r.canonical_url or r.url)
+        if parsed_c.scheme in {"http", "https"} and parsed_c.netloc:
+            origin = f"{parsed_c.scheme}://{parsed_c.netloc.rsplit('@', 1)[-1]}/"
+            if origin not in seen_origins:
+                seen_origins.add(origin)
+                ordered_urls.append(origin)
+    ordered_urls.extend(r.canonical_url or r.url for r in candidates)
+    for raw_url in ordered_urls:
+        decision = ctx.scope_engine.evaluate_url(raw_url, check_dns=check_dns)
         if not decision.allowed:
             ctx.coverage.record_out_of_scope(stage_def.stage_id, raw_url, decision.reason)
             continue
@@ -192,7 +206,7 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
             break
 
     if not target_urls:
-        seed_decision = ctx.scope_engine.evaluate_url(ctx.target, check_dns=True)
+        seed_decision = ctx.scope_engine.evaluate_url(ctx.target, check_dns=check_dns)
         if seed_decision.allowed:
             target_urls = [seed_decision.normalized_url]
         else:
@@ -202,6 +216,14 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
         reason = "No DNS-validated in-scope target URLs available for Nuclei"
         ctx.coverage.record_skipped_check(stage_def.stage_id, "nuclei_targets", reason)
         return _write_empty_result(ctx, stage_def, reason)
+
+    # -rl is a global rate. Keep the per-host budget: hosts run in parallel (-bs), so the
+    # global rate may not exceed per_host_rate * hosts-in-flight.
+    per_host_rate = max(1, int(float(limits.get("requests_per_host_per_sec", 5))))
+    hosts_in_scan = {urlsplit(u).hostname for u in target_urls}
+    bulk_size = max(1, min(bulk_size, len(hosts_in_scan)))
+    rate_limit = min(int(nuclei_cfg.get("rate_limit", 25)), per_host_rate * bulk_size)
+    concurrency = max(1, min(int(nuclei_cfg.get("concurrency", 10)), rate_limit))
 
     targets_rel = "analysis/.nuclei_targets.txt"
     targets_file: Path = ctx.workspace.write_text_atomic(
@@ -229,6 +251,13 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
     ]
     if templates_dir:
         cmd.extend(["-t", str(Path(templates_dir).expanduser().resolve())])
+    elif nuclei_cfg.get("automatic_scan", True):
+        # Wappalyzer-driven template selection: runs only templates relevant to detected
+        # technologies instead of the full corpus (which cannot finish at a polite rate).
+        cmd.append("-as")
+    extra_tags = str(nuclei_cfg.get("tags", "")).strip()
+    if extra_tags and re.fullmatch(r"[A-Za-z0-9_,.-]+", extra_tags):
+        cmd.extend(["-tags", extra_tags])
 
     findings: list[dict[str, Any]] = []
     notes: list[str] = []
@@ -251,7 +280,7 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
         safe_match = _redact_url(raw_match)
         if not safe_match:
             return
-        decision = ctx.scope_engine.evaluate_url(safe_match, check_dns=True)
+        decision = ctx.scope_engine.evaluate_url(safe_match, check_dns=check_dns)
         if not decision.allowed:
             return
         reported_ip = str(raw_item.get("ip") or "")
@@ -272,6 +301,7 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
         )
 
     inactivity_timeout = float(nuclei_cfg.get("inactivity_timeout_sec", 180))
+    proc = None
     try:
         proc = ctx.resource_governor.run_process(
             cmd,
@@ -330,7 +360,7 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
             if not safe_location:
                 # Never turn an unqualified host/template string into trusted evidence.
                 continue
-            match_decision = ctx.scope_engine.evaluate_url(safe_location, check_dns=True)
+            match_decision = ctx.scope_engine.evaluate_url(safe_location, check_dns=check_dns)
             if not match_decision.allowed:
                 ctx.coverage.record_out_of_scope(
                     stage_def.stage_id, safe_location, match_decision.reason
@@ -361,6 +391,18 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
     finally:
         targets_file.unlink(missing_ok=True)
 
+    if not findings:
+        # proc raised or stdout was lost: rebuild from the scope-validated streamed events.
+        findings = _findings_from_events(ctx, events_rel)
+    unique_findings: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for item in findings:
+        key = (item["template_id"], item["location"], item.get("matcher_name", ""))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_findings.append(item)
+    findings = unique_findings
+
     if completed:
         for url in target_urls:
             ctx.coverage.record_target_tested(stage_def.stage_id, url)
@@ -377,14 +419,14 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
         "notes": notes,
         "execution": {
             "completed": completed,
-            "return_code": proc.returncode if "proc" in locals() else None,
-            "timeout": bool(getattr(proc, "timed_out", False)) if "proc" in locals() else False,
-            "output_truncated": bool(getattr(proc, "output_truncated", False)) if "proc" in locals() else False,
-            "cancelled": bool(getattr(proc, "cancelled", False)) if "proc" in locals() else False,
-            "inactivity_timed_out": bool(getattr(proc, "inactivity_timed_out", False)) if "proc" in locals() else False,
+            "return_code": getattr(proc, "returncode", None),
+            "timeout": bool(getattr(proc, "timed_out", False)),
+            "output_truncated": bool(getattr(proc, "output_truncated", False)),
+            "cancelled": bool(getattr(proc, "cancelled", False)),
+            "inactivity_timed_out": bool(getattr(proc, "inactivity_timed_out", False)),
             "inactivity_timeout_sec": inactivity_timeout,
             "stderr_excerpt": _redact_text(
-                getattr(proc, "stderr", "") if "proc" in locals() else "",
+                getattr(proc, "stderr", "") or "",
                 4000,
             ),
             "streamed_events_artifact": events_rel,
@@ -412,6 +454,34 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
             "findings": len(findings),
         },
     )
+
+
+def _findings_from_events(ctx: ExecutionContext, events_rel: str) -> list[dict[str, Any]]:
+    try:
+        text = ctx.workspace.resolve_path(events_rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(ev, dict) or not ev.get("matched-at"):
+            continue
+        out.append({
+            "template_id": str(ev.get("template_id", "unknown")),
+            "title": str(ev.get("title", "Nuclei Finding")),
+            "severity": str(ev.get("severity", Severity.INFO.value)),
+            "category": "nuclei_template_match",
+            "location": str(ev["matched-at"]),
+            "matcher_name": "",
+            "extracted_results": [],
+            "description": "",
+            "curl_command": "",
+            "recovered_from_stream": True,
+        })
+    return out
 
 
 def parse_nuclei_jsonl(

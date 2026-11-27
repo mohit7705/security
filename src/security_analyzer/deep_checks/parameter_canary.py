@@ -10,6 +10,7 @@ import requests
 from security_analyzer.core.exceptions import ScopeViolationError
 from security_analyzer.core.orchestrator import ExecutionContext
 from security_analyzer.core.resource_governor import ResourceLimitExceeded
+from security_analyzer.intelligence.openapi_analyzer import is_oversize_error
 from security_analyzer.models.asset import make_asset_id
 from security_analyzer.models.finding import FindingRecord, Severity, Verdict
 
@@ -173,7 +174,9 @@ def run_parameter_canary_checks(
                                     },
                                 ),
                             )
-                    except ResourceLimitExceeded:
+                    except ResourceLimitExceeded as exc:
+                        if is_oversize_error(exc):
+                            continue
                         stats.budget_exhausted = True
                         break
                     except (ScopeViolationError, requests.RequestException):
@@ -228,7 +231,9 @@ def run_parameter_canary_checks(
                                 },
                             ),
                         )
-                except ResourceLimitExceeded:
+                except ResourceLimitExceeded as exc:
+                    if is_oversize_error(exc):
+                        continue
                     stats.budget_exhausted = True
                     break
                 except (ScopeViolationError, requests.RequestException):
@@ -282,7 +287,9 @@ def run_parameter_canary_checks(
                                 },
                             ),
                         )
-                except ResourceLimitExceeded:
+                except ResourceLimitExceeded as exc:
+                    if is_oversize_error(exc):
+                        continue
                     stats.budget_exhausted = True
                     break
                 except (ScopeViolationError, requests.RequestException):

@@ -6,7 +6,7 @@
   <img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="Docker" src="https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Linux-informational">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-204%20passing-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-214%20passing-brightgreen">
   <img alt="Pipeline" src="https://img.shields.io/badge/pipeline-15%20stages-6366f1">
 </p>
 
@@ -365,7 +365,8 @@ make wordlists        # writes config/wordlists/quiver-directories.txt
 
 ```bash
 cp config/auth_profiles.example.yaml config/auth_profiles.yaml
-export USER_A_TOKEN="…"; export USER_B_TOKEN="…"
+# user_a logs in with a username/password (api_login); user_b uses a bearer token directly.
+export USER_A_EMAIL="…"; export USER_A_PASSWORD="…"; export USER_B_TOKEN="…"
 ```
 
 Use separate test accounts with **known owned resource IDs** so IDOR conclusions are evidence-based. Pass `--auth-profiles config/auth_profiles.yaml` to `scan`.

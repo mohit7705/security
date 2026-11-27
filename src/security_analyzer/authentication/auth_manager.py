@@ -82,14 +82,30 @@ class AuthManager:
             self._contexts[ident_id] = ctx
 
             validation = self.session_manager.validate_session(profile, ctx, stage_id=stage_id, auto_refresh=True)
-            cookie_audit = self.store.audit_cookie_security(ctx.cookies, is_https=is_https)
+            if validation.get("state") not in {"anonymous", "not_configured"}:
+                ctx.status = str(validation.get("state", ctx.status))
+            if profile.auth_method == AuthMethod.COOKIE_SESSION:
+                # Cookie flags are synthesized from config, not observed from the server.
+                cookie_audit = []
+                ctx.notes.append("Cookie flag audit skipped: flags are not observable for configured cookies")
+            else:
+                cookie_audit = self.store.audit_cookie_security(ctx.cookies, is_https=is_https)
 
             logout_result: dict[str, Any] = {"tested": False, "reason": "disabled_by_policy"}
             if self.verify_logout and profile.auth_method != AuthMethod.ANONYMOUS and profile.logout_url:
                 logout_result = self.session_manager.verify_logout_invalidation(profile, ctx, stage_id=stage_id)
                 # Re-establish clean active session after logout test so downstream stages have a live token
                 if logout_result.get("server_invalidated_session"):
-                    ctx = self.session_manager.establish_context(profile, stage_id=stage_id)
+                    if profile.auth_method == AuthMethod.API_LOGIN:
+                        ctx = self.session_manager.establish_context(profile, stage_id=stage_id)
+                    else:
+                        # The configured token/cookie/state is now revoked and cannot be recreated.
+                        ctx.session_valid = False
+                        ctx.authenticated = False
+                        ctx.status = "revoked_by_logout_test"
+                        ctx.notes.append(
+                            "Credential revoked by the logout test; supply a fresh one or disable verify_logout_invalidation"
+                        )
                     self._contexts[ident_id] = ctx
 
             lifecycle_records.append(
@@ -157,12 +173,33 @@ def run_auth_session_lifecycle(ctx: ExecutionContext, stage_def: StageDefinition
         )
     ]
     status = StageStatus.PARTIAL if failed_auth else StageStatus.SUCCESS
+    non_anonymous = [r for r in audit_summary["records"] if r["identity"]["auth_method"] != "anonymous"]
+    unverified = [
+        r["identity"]["identity_id"]
+        for r in non_anonymous
+        if r not in failed_auth and r["validation"].get("state") == "not_configured"
+    ]
+    if not non_anonymous:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id,
+            "authenticated_identities",
+            "No authenticated identities configured; authorization/IDOR and business-logic coverage will be limited",
+        )
+    for identity_id in unverified:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id,
+            f"session_validation:{identity_id}",
+            "whoami_url not configured; session validity was not verified",
+        )
     return StageResult(
         stage_id=stage_def.stage_id,
         status=status,
         summary=(
             f"Initialized {audit_summary['total_identities']} identity context(s) "
-            f"({audit_summary['authenticated_identities']} authenticated, {len(failed_auth)} failed)"
+            f"({audit_summary['authenticated_identities']} authenticated, {len(failed_auth)} failed"
+            + (", no authenticated identities configured" if not non_anonymous else "")
+            + (f", {len(unverified)} unverified" if unverified else "")
+            + ")"
         ),
         artifacts=["analysis/auth_sessions.json"],
         metrics={

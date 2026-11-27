@@ -9,12 +9,24 @@ timeouts:
   http_read_sec: 20
   max_redirects: 5
   subfinder_sec: 120
+  assetfinder_sec: 120
+  amass_sec: 300
+  bbot_sec: 300
   directory_scan_sec: 420
+  directory_stage_sec: 1800
   katana_sec: 120
   feroxbuster_sec: 420
   gau_sec: 120
   waybackurls_sec: 120
   httpx_sec: 120
+  http_probe_stage_sec: 900
+  redirect_stage_sec: 600
+  tls_stage_sec: 1200
+  dns_stage_sec: 600
+  api_intel_stage_sec: 600
+  authz_stage_sec: 600
+  logic_stage_sec: 300
+  security_review_stage_sec: 300
   whatweb_sec: 120
   nuclei_sec: 900
   tls_sec: 10
@@ -23,6 +35,13 @@ timeouts:
 
 limits:
   max_urls_per_stage: 2500
+  http_probe_max_failure_ratio: 0.5
+  redirect_max_failure_ratio: 0.5
+  tls_max_failure_ratio: 0.5
+  max_testssl_origins: 5
+  max_api_inventory_endpoints: 5000
+  deep_checks_max_failure_ratio: 0.5
+  header_review_max_failure_ratio: 0.5
   max_header_review_endpoints: 50
   max_directory_words: 4000
   max_concurrent_requests: 10
@@ -48,6 +67,13 @@ browser:
   max_console_events: 500
   record_har: true
   har_mode: "minimal"
+  max_attempts: 50                 # total navigations incl. failures (default 2 x max_pages)
+  max_crawl_sec_per_identity: 600  # wall-clock cap per identity
+  max_stage_sec: 1800              # wall-clock cap for the whole browser stage
+  max_consecutive_failures: 5      # stop an identity after N failed navigations in a row
+  max_query_variants_per_path: 3   # crawl-trap guard for ?page=1..N style URLs
+  max_seed_hosts: 10
+  block_resource_types: ["media", "font"]
   katana_enabled: true
   katana_timeout_sec: 300
   katana_request_timeout_sec: 10

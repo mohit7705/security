@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,12 @@ from security_analyzer.utils.http_client import ScopedHttpClient
 
 
 _TEMPLATE_PARAMETER_RE = re.compile(r"\{([^{}]+)\}")
-_ID_PARAMETER_RE = re.compile(r"(?i)(^id$|_id$|id$|uuid|^key$|_key$)")
+# The old pattern `id$` matched any name ending in "id" (paid, valid, grid, invalid).
+_ID_PARAMETER_RE = re.compile(
+    r"(?:(?i:^id$|[_-]id$|uuid|^key$|[_-]key$"
+    r"|(?:user|account|order|customer|item|post|product|resource|object|session|doc|file|team|org|tenant|project|invoice|comment|ticket|message|record|entity)id$)"
+    r"|[a-z]Id$|[a-z]ID$)"
+)
 
 
 def _concrete_route_variants(route_url: str, owned_ids: list[str]) -> list[str]:
@@ -44,7 +50,7 @@ def _concrete_route_variants(route_url: str, owned_ids: list[str]) -> list[str]:
 
 
 def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -> StageResult:
-    """Stage 10: Builds structured API catalog (OpenAPI, GraphQL, JS, browser XHR) and updates inventory."""
+    """Stage 11: Builds structured API catalog (OpenAPI, GraphQL, JS, browser XHR) and updates inventory."""
     inventory = UnifiedEndpointInventory(ctx.workspace)
     normalizer = EndpointNormalizer(
         ctx.scope_engine,
@@ -64,6 +70,12 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
         governor=ctx.resource_governor,
     )
 
+    check_dns = bool(ctx.config.get("scope", {}).get("check_dns", False))
+    stage_deadline = time.monotonic() + float(timeouts.get("api_intel_stage_sec", 600))
+    api_inventory_cap = int(limits.get("max_api_inventory_endpoints", 5000))
+    inventory_added = 0
+    inventory_cap_hit = False
+
     all_eps = inventory.get_endpoints()
     base_urls = sorted({f"{ep.scheme}://{ep.hostname}" + (f":{ep.port}" if ep.port not in {80, 443} else "") for ep in all_eps})[:100]
     if not base_urls:
@@ -81,17 +93,21 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
         if "{" not in url and "}" not in url and "graphql" in url.lower()
     ]
 
-    openapi_analyzer = OpenApiAnalyzer(client, stage_id=stage_def.stage_id)
+    openapi_analyzer = OpenApiAnalyzer(client, stage_id=stage_def.stage_id, check_dns=check_dns)
+    openapi_analyzer.deadline = stage_deadline
     specs, openapi_ops, openapi_findings = openapi_analyzer.discover_and_parse(base_urls, candidate_specs)
 
-    graphql_analyzer = GraphQlAnalyzer(client, stage_id=stage_def.stage_id)
+    graphql_analyzer = GraphQlAnalyzer(client, stage_id=stage_def.stage_id, check_dns=check_dns)
+    graphql_analyzer.deadline = stage_deadline
     gql_endpoints, gql_ops, gql_findings = graphql_analyzer.analyze(base_urls, candidate_gql)
 
     js_analyzer = JsBundleAnalyzer(
         client,
         stage_id=stage_def.stage_id,
         max_bundles=int(limits.get("max_js_bundles", 30)),
+        check_dns=check_dns,
     )
+    js_analyzer.deadline = stage_deadline
     bundle_urls = js_analyzer.discover_bundle_urls(html_pages, known_urls)
     bundle_records, js_routes, js_findings = js_analyzer.analyze_bundles(bundle_urls)
 
@@ -144,7 +160,12 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
     all_operations: list[ApiOperationRecord] = [*openapi_ops, *gql_ops]
 
     for route_url in js_routes[:2000]:
+        if inventory_cap_hit:
+            break
         for concrete_route in _concrete_route_variants(route_url, owned_ids):
+            if inventory_added >= api_inventory_cap:
+                inventory_cap_hit = True
+                break
             ep = normalizer.normalize(
                 concrete_route,
                 method="GET",
@@ -154,6 +175,7 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
                 tags=["api_candidate", "js_extracted"],
             )
             if ep is not None:
+                inventory_added += 1
                 inventory.upsert_endpoint(ep)
                 all_operations.append(
                     ApiOperationRecord(
@@ -170,7 +192,12 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
     for op in [*openapi_ops, *gql_ops][:5000]:
         # Inventory all configured owned resource IDs so later identity-aware
         # authorization checks can select the correct actor-owned resource.
+        if inventory_cap_hit:
+            break
         for concrete_url in _owned_id_variants(op):
+            if inventory_added >= api_inventory_cap:
+                inventory_cap_hit = True
+                break
             ep = normalizer.normalize(
                 concrete_url,
                 method=op.method,
@@ -189,11 +216,14 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
                 ],
             )
             if ep is not None:
+                inventory_added += 1
                 inventory.upsert_endpoint(ep)
 
     # Include browser-captured API candidates already in inventory
+    known_ops = {(o.url, o.method) for o in all_operations}  # set lookup instead of O(n^2) scan
     for ep in inventory.get_endpoints():
-        if "api_candidate" in ep.tags and not any(o.url == ep.url and o.method == ep.method for o in all_operations):
+        if "api_candidate" in ep.tags and (ep.url, ep.method) not in known_ops:
+            known_ops.add((ep.url, ep.method))
             all_operations.append(
                 ApiOperationRecord(
                     operation_id=f"obs.{ep.endpoint_id}",
@@ -208,6 +238,25 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
 
     combined_findings = [*openapi_findings, *gql_findings, *js_findings]
 
+    analyzers = (openapi_analyzer, graphql_analyzer, js_analyzer)
+    budget_exhausted = any(a.budget_exhausted for a in analyzers)
+    deadline_hit = any(a.deadline_hit for a in analyzers)
+    oversize_skipped = sum(a.oversize_skipped for a in analyzers)
+    if budget_exhausted:
+        ctx.coverage.record_skipped_check(stage_def.stage_id, "http_resource_budget", "Scan-wide resource budget exhausted during API/JS discovery")
+    if deadline_hit:
+        ctx.coverage.record_skipped_check(stage_def.stage_id, "api_intel_stage_budget", "API/JS discovery stopped at the stage time budget")
+    if inventory_cap_hit:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id, "max_api_inventory_endpoints",
+            f"API inventory expansion capped at {api_inventory_cap} endpoint(s)",
+        )
+    if oversize_skipped:
+        ctx.coverage.record_skipped_check(
+            stage_def.stage_id, "oversize_responses",
+            f"{oversize_skipped} spec/bundle/source-map response(s) exceeded the response size limit and were skipped",
+        )
+
     api_catalog_payload: dict[str, Any] = {
         "schema_version": "1.0",
         "scan_id": ctx.workspace.scan_id,
@@ -218,6 +267,10 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
         "total_operations": len(all_operations),
         "operations": [op.to_dict() for op in all_operations],
         "findings": combined_findings,
+        "budget_exhausted": budget_exhausted,
+        "deadline_hit": deadline_hit,
+        "oversize_skipped": oversize_skipped,
+        "inventory_cap_hit": inventory_cap_hit,
     }
     js_intel_payload: dict[str, Any] = {
         "schema_version": "1.0",
@@ -235,7 +288,12 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
     inv_saved = inventory.save(stage_id=stage_def.stage_id)
 
     no_discovery = not all_operations and not bundle_records
-    status = StageStatus.PARTIAL if no_discovery or not base_urls else StageStatus.SUCCESS
+    # An application with no API/JS surface is a valid result; only a truncated run is PARTIAL.
+    status = (
+        StageStatus.PARTIAL
+        if budget_exhausted or deadline_hit or inventory_cap_hit or not base_urls
+        else StageStatus.SUCCESS
+    )
     return StageResult(
         stage_id=stage_def.stage_id,
         status=status,
@@ -250,5 +308,6 @@ def run_api_js_intelligence(ctx: ExecutionContext, stage_def: StageDefinition) -
             "targets_total": len(base_urls) + len(bundle_urls),
             "targets_tested": len(base_urls) + len(bundle_records),
             "targets_skipped": max(0, len(bundle_urls) - len(bundle_records)),
+            "oversize_skipped": oversize_skipped,
         },
     )

@@ -93,7 +93,8 @@ class StorageStateStore:
             looks_sensitive = bool(session_name_re.search(name))
             http_only = bool(c.get("httpOnly", False))
             secure = bool(c.get("secure", False))
-            same_site = str(c.get("sameSite", "None") or "None")
+            # Empty means the server sent no SameSite attribute (browser default Lax): not a finding.
+            same_site = str(c.get("sameSite") or "")
 
             issues: list[str] = []
             if looks_sensitive and not http_only:
