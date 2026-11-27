@@ -309,7 +309,7 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
     max_query_variants = int(browser_cfg.get("max_query_variants_per_path", 3))
     max_seed_hosts = int(browser_cfg.get("max_seed_hosts", 10))
     block_resource_types = list(browser_cfg.get("block_resource_types", ["media", "font"]))
-    stage_deadline = time.monotonic() + max(60, max_stage_sec)
+    stage_deadline = time.monotonic() + max(1, max_stage_sec)
 
     if max_pages < 1 or max_depth < 0 or nav_timeout_ms < 1000 or settle_wait_ms < 0:
         raise ValueError("Invalid browser limits: max_pages, max_depth, navigation_timeout_ms or settle_wait_ms")
@@ -532,13 +532,17 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                         continue
 
                     attempts += 1
+                    remaining_ms = max(1, int((min(crawl_deadline, stage_deadline) - time.monotonic()) * 1000))
+                    effective_nav_timeout_ms = min(nav_timeout_ms, remaining_ms)
                     try:
                         response = page.goto(
                             decision.normalized_url,
                             wait_until="domcontentloaded",
-                            timeout=nav_timeout_ms,
+                            timeout=effective_nav_timeout_ms,
                         )
-                        page.wait_for_timeout(settle_wait_ms)
+                        remaining_after_nav_ms = max(0, int((min(crawl_deadline, stage_deadline) - time.monotonic()) * 1000))
+                        if remaining_after_nav_ms > 0 and settle_wait_ms:
+                            page.wait_for_timeout(min(settle_wait_ms, remaining_after_nav_ms))
                     except Exception as exc:
                         consecutive_failures += 1
                         err_msg = f"{type(exc).__name__}: {exc}"
@@ -553,6 +557,8 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                             decision.normalized_url,
                             err_msg[:300],
                         )
+                        if ctx.progress_callback:
+                            ctx.progress_callback({"progress_percent": min(99, int(attempts / max(1, max_attempts) * 100)), "completed": attempts, "planned": max_attempts, "message": f"Navigation failed: {type(exc).__name__}; continuing within crawl budget"})
                         continue
 
                     consecutive_failures = 0
@@ -636,6 +642,8 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
                     }
                     visited_pages.append(visited_entry)
                     all_visited_pages.append(visited_entry)
+                    if ctx.progress_callback:
+                        ctx.progress_callback({"progress_percent": min(99, int(attempts / max(1, max_attempts) * 100)), "completed": attempts, "planned": max_attempts, "message": f"Visited {len(visited_pages)} page(s); {len(queue)} queued"})
 
                     nav_endpoint = normalizer.normalize(
                         final_decision.normalized_url,
@@ -995,5 +1003,7 @@ def run_browser_capture(ctx: ExecutionContext, stage_def: StageDefinition) -> St
             "budget_blocked_requests": total_budget_blocked,
             "katana_records_received": len(katana_records),
             "katana_endpoints_added": katana_endpoints_added,
+            "crawl_attempts": sum(int(item.get("crawl_attempts", 0)) for item in identity_results),
+            "planned_attempts_per_identity": max_attempts,
         },
     )

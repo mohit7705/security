@@ -141,7 +141,10 @@ def _run_httpx_toolkit(
         return {}, "httpx binary on PATH is not ProjectDiscovery httpx (install httpx-toolkit)"
 
     rate = min(max(1, int(getattr(governor, "requests_per_host_per_sec", 5))), 25)
-    timeout_sec = _scaled_timeout(timeout_sec, len(urls), rate)
+    timeout_sec = min(
+        _scaled_timeout(timeout_sec, len(urls), rate),
+        max(1, int(timeout_sec)),
+    )
     with tempfile.TemporaryDirectory(prefix="security-analyzer-httpx-") as tmp_dir:
         targets_file = Path(tmp_dir) / "targets.txt"
         targets_file.write_text("\n".join(urls) + "\n", encoding="utf-8")
@@ -343,6 +346,23 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         governor=ctx.resource_governor,
     )
 
+    stage_budget = max(1.0, float(timeouts.get("http_probe_stage_sec", 900)))
+    stage_deadline = time.monotonic() + stage_budget
+
+    def emit_progress(completed: int, total: int, message: str) -> None:
+        callback = getattr(ctx, "progress_callback", None)
+        if callable(callback):
+            percent = 100 if total <= 0 else min(99, max(0, int(completed * 100 / total)))
+            try:
+                callback({
+                    "progress_percent": percent,
+                    "message": message[:180],
+                    "completed": max(0, int(completed)),
+                    "total": max(0, int(total)),
+                })
+            except Exception:
+                pass
+
     raw_candidates = inventory.get_endpoints(include_excluded=False)
     candidates: list[Any] = []
     seen_probe_keys: set[tuple[str, str]] = set()
@@ -415,13 +435,14 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
             stage_def.stage_id, "external_probe_tools",
             "httpx-toolkit/whatweb skipped: scoped egress proxy is not enforced",
         )
-    if egress_enforced and ctx.resource_governor is not None and non_loopback_urls:
+    if egress_enforced and ctx.resource_governor is not None and non_loopback_urls and time.monotonic() < stage_deadline:
+        remaining_tool_budget = max(1, int(stage_deadline - time.monotonic()))
         httpx_map, httpx_err = _run_httpx_toolkit(
             non_loopback_urls,
             proxy_url=proxy_url,
             scope_engine=ctx.scope_engine,
             check_dns=check_dns,
-            timeout_sec=int(timeouts.get("httpx_sec", 120)),
+            timeout_sec=min(int(timeouts.get("httpx_sec", 120)), remaining_tool_budget),
             governor=ctx.resource_governor,
         )
         if httpx_map:
@@ -432,7 +453,7 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         whatweb_map, whatweb_err = _run_whatweb(
             non_loopback_hosts,
             proxy_url=proxy_url,
-            timeout_sec=int(timeouts.get("whatweb_sec", 120)),
+            timeout_sec=min(int(timeouts.get("whatweb_sec", 120)), max(1, int(stage_deadline - time.monotonic()))),
             governor=ctx.resource_governor,
         )
         if whatweb_map:
@@ -442,7 +463,7 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
 
         nmap_map, nmap_err = _run_nmap(
             non_loopback_hosts,
-            timeout_sec=int(timeouts.get("nmap_sec", 180)),
+            timeout_sec=min(int(timeouts.get("nmap_sec", 180)), max(1, int(stage_deadline - time.monotonic()))),
             governor=ctx.resource_governor,
         )
         if nmap_map:
@@ -454,19 +475,34 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         elif nmap_err:
             ctx.coverage.record_skipped_check(stage_def.stage_id, "nmap", nmap_err)
 
-    stage_budget = float(timeouts.get("http_probe_stage_sec", 900))
-    deadline = time.monotonic() + stage_budget
+    deadline = stage_deadline
     workers = max(1, min(int(getattr(ctx.resource_governor, "max_concurrent_requests", 4) or 4), 8))
     stop = threading.Event()
     plan = [(ep, ep.method if ep.method in {"GET", "HEAD", "OPTIONS"} else "GET") for ep in candidates]
+    emit_progress(0, len(plan), f"HTTP probing starting: {len(plan)} unique safe endpoint(s)")
+    outcomes_by_index: dict[int, tuple[str, Any, float]] = {}
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="http-probe") as pool:
-        futures = [
-            pool.submit(_probe_one, client, ep, method, stage_def.stage_id, deadline, stop)
-            for ep, method in plan
-        ]
-        outcomes = [f.result() for f in futures]
+        futures = {
+            pool.submit(_probe_one, client, ep, method, stage_def.stage_id, deadline, stop): index
+            for index, (ep, method) in enumerate(plan)
+        }
+        completed_futures = 0
+        from concurrent.futures import as_completed
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                outcomes_by_index[index] = future.result()
+            except Exception as exc:
+                outcomes_by_index[index] = ("error", exc, 0.0)
+            completed_futures += 1
+            emit_progress(
+                completed_futures,
+                len(plan),
+                f"HTTP probing: completed {completed_futures}/{len(plan)} endpoint checks",
+            )
 
-    for (ep, method), (kind, resp, elapsed_ms) in zip(plan, outcomes):
+    for index, (ep, method) in enumerate(plan):
+        kind, resp, elapsed_ms = outcomes_by_index.get(index, ("deadline", None, 0.0))
         if kind == "budget":
             budget_exhausted = True
             failed += 1
@@ -589,6 +625,11 @@ def run_http_probing(ctx: ExecutionContext, stage_def: StageDefinition) -> Stage
         else StageStatus.SUCCESS
     )
 
+    emit_progress(
+        100,
+        100,
+        f"HTTP probing finished: {tested} tested, {failed} failed, {deadline_skipped} not started",
+    )
     return StageResult(
         stage_id=stage_def.stage_id,
         status=status,

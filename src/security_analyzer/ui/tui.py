@@ -31,6 +31,8 @@ class StageView:
     summary: str = ""
     error: str = ""
     duration: float = 0.0
+    progress_percent: int = 0
+    progress_message: str = ""
     started_mono: float | None = None
     started_clock: str = ""
     artifacts: list[dict[str, Any]] = field(default_factory=list)
@@ -113,6 +115,12 @@ class QuiverApp(App[None]):
                 view.artifacts = list(item.get("artifact_info", []))
                 self._fill_stage(view)
                 self._refresh_label(view)
+        elif event.get("type") == "stage_progress":
+            view = self._stage_views.get(event["stage_id"])
+            if view is not None:
+                view.progress_percent = max(0, min(100, int(event.get("progress_percent", 0))))
+                view.progress_message = str(event.get("message", ""))[:160]
+                self._fill_stage(view)
         elif event.get("type") == "stage":
             existing = self._stage_views.get(event["stage_id"])
             view = self._ensure_stage(
@@ -163,7 +171,9 @@ class QuiverApp(App[None]):
             node.add_leaf(Text("Not started yet", style="grey50"))
             return
         if view.status == "RUNNING":
-            node.add_leaf(Text(f"Running… started {view.started_clock or 'just now'}", style="cyan"))
+            node.add_leaf(Text(f"Running… started {view.started_clock or 'just now'} · {view.progress_percent}%", style="cyan"))
+            if view.progress_message:
+                node.add_leaf(Text(f"Progress  {view.progress_message}", style="grey70"))
             return
         node.add_leaf(Text(f"Status   {view.status} · {fmt_duration(view.duration)} · phase: {view.phase or '-'}"))
         if view.summary:

@@ -72,6 +72,7 @@ class ExecutionContext:
     auth_manager: Any = None
     resource_governor: ResourceGovernor | None = None
     baseline_scan_id: str | None = None
+    progress_callback: Callable[[dict[str, Any]], None] | None = None
 
 
 StageRunner = Callable[[ExecutionContext, StageDefinition], StageResult]
@@ -512,7 +513,8 @@ class PipelineOrchestrator:
         shared_auth_manager: Any = None
         active_baseline_id = str(self.state.get("baseline_scan_id") or "").strip() or None
 
-        for stage_id in self.ordered_ids:
+        selected_order = [sid for sid in self.ordered_ids if selected_stages is None or sid in selected_stages]
+        for stage_index, stage_id in enumerate(self.ordered_ids):
             if selected_stages is not None and stage_id not in selected_stages:
                 continue
 
@@ -596,6 +598,9 @@ class PipelineOrchestrator:
                 auth_manager=shared_auth_manager,
                 resource_governor=self.resource_governor,
                 baseline_scan_id=active_baseline_id,
+                progress_callback=lambda payload, sid=stage_id: self._emit({
+                    "type": "stage_progress", "stage_id": sid, **payload
+                }),
             )
             try:
                 result = runner(context, stage_def)
@@ -801,6 +806,8 @@ class PipelineOrchestrator:
             "error": error,
             "artifacts": list(artifacts),
             "duration_sec": self.state["stages"][stage_id]["duration_sec"],
+            "progress_percent": 100 if finished else 0,
+            "reason": summary if finished and status in {StageStatus.PARTIAL, StageStatus.FAILED, StageStatus.SKIPPED} else "",
         })
 
     def _compute_overall_status(self) -> StageStatus:

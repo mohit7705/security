@@ -96,28 +96,33 @@ def _run_external_tool(
 
     # Keep whatever the tool printed before it was stopped, so callers can
     # salvage partial results (FIX 4).
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+
     if proc.timed_out:
-        return False, proc.stdout or "", f"{tool_name} timed out after {timeout_sec}s"
+        return False, stdout, f"{tool_name} timed out after {timeout_sec}s"
 
     if proc.output_truncated:
         return (
             False,
-            proc.stdout or "",
+            stdout,
             f"{tool_name} output exceeded the configured process-output limit",
         )
 
     if proc.returncode != 0:
-        detail = (
-            (proc.stderr or "").strip()[:200]
-            or f"exit code {proc.returncode}"
-        )
+        # Keep the tail: startup banners (notably BBOT's) often precede the
+        # actionable CLI error, so truncating the beginning hides the cause.
+        detail = (stderr.strip() or stdout.strip())[-500:]
+        detail = " ".join(detail.split())
+        if not detail:
+            detail = f"exit code {proc.returncode}"
         return (
             False,
-            "",
-            f"{tool_name} returned non-zero status: {detail}",
+            stdout,
+            f"{tool_name} returned non-zero status ({proc.returncode}): {detail}",
         )
 
-    return True, proc.stdout or "", ""
+    return True, stdout, ""
 
 
 def _normalize_discovered_host(value: object) -> str | None:
@@ -179,12 +184,22 @@ def _finish_line_tool(ok: bool, stdout: str, error: str) -> tuple[bool, list[str
 
 @lru_cache(maxsize=1)
 def _amass_supports_legacy_flags(binary: str) -> bool:
-    """True for amass v3 (-passive/-json); False for v4+ where they were removed."""
+    """Detect the complete Amass v3 flag pair used by the legacy runner.
+
+    Checking only ``-passive`` is unsafe: some builds expose that flag while
+    rejecting ``-json``. The legacy command is selected only when both flags
+    are advertised by the installed binary.
+    """
     try:
         out = subprocess.run(
-            [binary, "enum", "-h"], capture_output=True, text=True, timeout=15, check=False,
+            [binary, "enum", "-h"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
-        return "-passive" in (out.stdout + out.stderr)
+        help_text = f"{out.stdout or ''}\n{out.stderr or ''}"
+        return "-passive" in help_text and "-json" in help_text
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -308,8 +323,9 @@ def _run_amass(
             except OSError:
                 pass
 
+        followup_error = ""
         if not legacy and ok:
-            ok2, subs_out, _err2 = _run_external_tool(
+            ok2, subs_out, err2 = _run_external_tool(
                 "amass",
                 [binary, "subs", "-d", root_domain, "-names", "-dir", temp_dir, "-nocolor"],
                 min(60, int(timeout_sec)),
@@ -317,11 +333,16 @@ def _run_amass(
             )
             if ok2:
                 found.update(_hosts_from_lines(subs_out))
+            else:
+                followup_error = f"Amass enum completed but 'amass subs' failed: {err2}"
 
         if found:
-            return True, sorted(found), ("" if ok else f"partial results kept: {error}")
+            warnings = [item for item in (error if not ok else "", followup_error) if item]
+            return True, sorted(found), "; ".join(warnings)
         if not ok:
             return False, [], error
+        if followup_error:
+            return False, [], followup_error
         return False, [], "amass completed but returned no hostnames"
 
 
@@ -360,20 +381,44 @@ def _run_bbot(
 
         found: set[str] = set()
 
+        def _collect_event(event: object) -> None:
+            if not isinstance(event, dict):
+                return
+            if str(event.get("type", "")).upper() != "DNS_NAME":
+                return
+            data = event.get("data")
+            if isinstance(data, dict):
+                data = data.get("host") or data.get("hostname") or data.get("name")
+            host = _normalize_discovered_host(data)
+            if host:
+                found.add(host)
+
         def _collect(text: str) -> None:
+            if not text.strip():
+                return
+            # Support both a JSON document/array and JSONL/NDJSON event streams.
+            try:
+                document = json.loads(text)
+            except json.JSONDecodeError:
+                document = None
+            if isinstance(document, list):
+                for event in document:
+                    _collect_event(event)
+                return
+            if isinstance(document, dict):
+                _collect_event(document)
+                return
             for line in text.splitlines():
                 try:
-                    event = json.loads(line)
+                    _collect_event(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-                if isinstance(event, dict) and event.get("type") == "DNS_NAME":
-                    host = _normalize_discovered_host(event.get("data"))
-                    if host:
-                        found.add(host)
 
-        # bbot writes events to <output dir>/<scan name>/output.json (or .ndjson);
-        # stdout only carries human-readable logs.
-        for out_file in Path(temp_dir).rglob("output.*json"):
+        # BBOT output modules can create output.json, output.ndjson, or a
+        # similarly named JSON file inside the scan-specific output directory.
+        for out_file in Path(temp_dir).rglob("*"):
+            if not out_file.is_file() or out_file.suffix.lower() not in {".json", ".jsonl", ".ndjson"}:
+                continue
             try:
                 _collect(out_file.read_text(encoding="utf-8", errors="replace"))
             except OSError:
@@ -384,7 +429,7 @@ def _run_bbot(
             return True, sorted(found), ("" if ok else f"partial results kept: {error}")
         if not ok:
             return False, [], error
-        return False, [], "bbot completed but returned no DNS_NAME events"
+        return False, [], "bbot completed successfully but produced no parseable DNS_NAME events"
 
 
 def run_domain_enumeration(
@@ -414,6 +459,10 @@ def run_domain_enumeration(
     }
 
     tools_used: set[str] = set()
+    attempted_tools: set[str] = set()
+    failed_tools: set[str] = set()
+    partial_tools: set[str] = set()
+    tool_stats: dict[str, dict[str, object]] = {}
     notes: list[str] = []
 
     enumeration_tools = (
@@ -443,15 +492,29 @@ def run_domain_enumeration(
                     )
                 )
 
+                attempted_tools.add(tool_name)
                 ok, hosts, reason = runner(
                     root_domain,
                     timeout_sec,
                     ctx.resource_governor,
                 )
+                stats = tool_stats.setdefault(
+                    tool_name,
+                    {"attempts": 0, "successful_runs": 0, "failed_runs": 0,
+                     "partial_runs": 0, "discovered_hosts": set()},
+                )
+                stats["attempts"] = int(stats["attempts"]) + 1
 
                 if ok:
 
                     tools_used.add(tool_name)
+                    stats["successful_runs"] = int(stats["successful_runs"]) + 1
+                    if reason:
+                        partial_tools.add(tool_name)
+                        stats["partial_runs"] = int(stats["partial_runs"]) + 1
+                    discovered_for_tool = stats["discovered_hosts"]
+                    if isinstance(discovered_for_tool, set):
+                        discovered_for_tool.update(hosts)
 
                     for host in hosts:
                         candidate_hosts.setdefault(
@@ -464,6 +527,8 @@ def run_domain_enumeration(
 
                 else:
 
+                    failed_tools.add(tool_name)
+                    stats["failed_runs"] = int(stats["failed_runs"]) + 1
                     note = (
                         f"{tool_name} ({root_domain}): {reason}"
                     )
@@ -620,6 +685,16 @@ def run_domain_enumeration(
         "seed_target": seed_url,
         "subfinder_used": "subfinder" in tools_used,  # legacy key, kept for compatibility
         "enumeration_tools_used": sorted(tools_used),
+        "enumeration_tools": {
+            name: {
+                "attempts": int(stats["attempts"]),
+                "successful_runs": int(stats["successful_runs"]),
+                "failed_runs": int(stats["failed_runs"]),
+                "partial_runs": int(stats["partial_runs"]),
+                "discovered_hosts": len(stats["discovered_hosts"]),
+            }
+            for name, stats in sorted(tool_stats.items())
+        },
         "notes": notes,
         "hosts": [
             asset.to_dict()
@@ -637,9 +712,14 @@ def run_domain_enumeration(
         and ctx.scope_engine.policy.allowed_domains
     )
 
+    # A successful seed asset must not mask failed enumerators. The stage is
+    # SUCCESS only when enumeration was not requested, or every attempted
+    # enumerator completed without an execution/parse failure and at least one
+    # in-scope asset was retained. Partial results remain usable downstream,
+    # but the stage must be visibly PARTIAL.
     status = (
         StageStatus.SUCCESS
-        if (tools_used or subdomains_not_requested) and assets
+        if assets and (subdomains_not_requested or (attempted_tools and not failed_tools and not partial_tools))
         else StageStatus.PARTIAL
     )
 
@@ -683,5 +763,10 @@ def run_domain_enumeration(
                 len(candidate_hosts) - len(assets),
             ),
             "enumeration_tools_used": len(tools_used),
+            "enumeration_tools_attempted": len(attempted_tools),
+            "enumeration_tools_failed": len(failed_tools),
+            "enumeration_tools_failed_names": sorted(failed_tools),
+            "enumeration_tools_partial": len(partial_tools),
+            "enumeration_tools_partial_names": sorted(partial_tools),
         },
     )

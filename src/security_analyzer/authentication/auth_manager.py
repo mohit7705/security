@@ -172,8 +172,8 @@ def run_auth_session_lifecycle(ctx: ExecutionContext, stage_def: StageDefinition
             and bool(record["identity"].get("session_valid"))
         )
     ]
-    status = StageStatus.PARTIAL if failed_auth else StageStatus.SUCCESS
     non_anonymous = [r for r in audit_summary["records"] if r["identity"]["auth_method"] != "anonymous"]
+    status = StageStatus.PARTIAL if (failed_auth or not non_anonymous) else StageStatus.SUCCESS
     unverified = [
         r["identity"]["identity_id"]
         for r in non_anonymous
@@ -197,7 +197,7 @@ def run_auth_session_lifecycle(ctx: ExecutionContext, stage_def: StageDefinition
         summary=(
             f"Initialized {audit_summary['total_identities']} identity context(s) "
             f"({audit_summary['authenticated_identities']} authenticated, {len(failed_auth)} failed"
-            + (", no authenticated identities configured" if not non_anonymous else "")
+            + (", anonymous-only mode: authenticated checks unavailable" if not non_anonymous else "")
             + (f", {len(unverified)} unverified" if unverified else "")
             + ")"
         ),

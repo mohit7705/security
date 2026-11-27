@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -112,6 +113,26 @@ def build_orchestrator(
     )
 
     policy = ScopePolicy.from_yaml(scope_path, target_url=target)
+    target_host = (urlsplit(target).hostname or "").lower().rstrip(".")
+    # The repository ships an example.com template. For the default template only,
+    # bind scope to the explicitly supplied host; do not silently authorize sibling
+    # subdomains. A user-provided non-template policy remains authoritative.
+    if policy.allowed_domains == ["example.com"] and target_host and target_host != "example.com":
+        policy = ScopePolicy(
+            allowed_domains=[target_host],
+            include_subdomains=False,
+            allowed_schemes=list(policy.allowed_schemes),
+            allowed_ports=list(policy.allowed_ports),
+            excluded_paths=list(policy.excluded_paths),
+            allowed_cidrs=list(policy.allowed_cidrs),
+            allow_private_ips=policy.allow_private_ips,
+        )
+        settings["scope_resolution"] = {
+            "mode": "default_exact_host",
+            "host": target_host,
+            "include_subdomains": False,
+            "reason": "Default example.com template was bound to the explicitly supplied target host; subdomains require explicit scope.",
+        }
     scope_engine = ScopeEngine(policy)
     scope_engine.enforce_url(target, check_dns=True)
 

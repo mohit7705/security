@@ -26,6 +26,11 @@ class PlainProgress:
                 self._index[stage["stage_id"]] = number
                 self._titles[stage["stage_id"]] = stage["title"]
             return
+        if event.get("type") == "stage_progress":
+            percent = max(0, min(100, int(event.get("progress_percent", 0))))
+            detail = str(event.get("message", ""))[:140]
+            self._write(f"     {percent:>3}%  {detail}")
+            return
         if event.get("type") != "stage":
             return
         stage_id = event["stage_id"]
@@ -37,5 +42,7 @@ class PlainProgress:
         elif status in TERMINAL_STATUSES:
             line = f" {status_symbol(status, unicode_ok=self._unicode)} {number:>2}  {title}  {fmt_duration(event.get('duration_sec'))}"
             if status != "SUCCESS" and event.get("summary"):
-                line += f"  - {str(event['summary'])[:100]}"
+                line += f"  - {str(event['summary'])[:140]}"
+            if status == "FAILED" and event.get("error"):
+                line += f" | reason: {str(event['error'])[:180]}"
             self._write(line)

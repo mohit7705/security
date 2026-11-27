@@ -587,7 +587,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
     max_paths = max(0, min(int(limits.get("max_directory_words", 250)), 10000))
     configured_wl = ctx.config.get("wordlists", {}).get("directories")
     words = _load_wordlist(configured_wl, max_paths)
-    stage_deadline = time.monotonic() + max(60, int(timeouts.get("directory_stage_sec", 1800)))
+    stage_deadline = time.monotonic() + max(1, int(timeouts.get("directory_stage_sec", 1800)))
 
     inventory = UnifiedEndpointInventory(ctx.workspace)
     existing_inventory_urls: set[str] = {
@@ -616,6 +616,19 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
     skipped_count = 0
     partial_reasons: list[str] = []
     tools_used: set[str] = set()
+
+    def emit_progress(percent: int, message: str, completed: int = 0, total: int = 0) -> None:
+        callback = getattr(ctx, "progress_callback", None)
+        if callable(callback):
+            try:
+                callback({
+                    "progress_percent": max(0, min(99, int(percent))),
+                    "message": message[:180],
+                    "completed": max(0, int(completed)),
+                    "total": max(0, int(total)),
+                })
+            except Exception:
+                pass  # Progress reporting must not interrupt scanning.
 
     ffuf_available = shutil.which("ffuf") is not None
     proxy_url = os.environ.get("SECURITY_ANALYZER_PROXY", "").strip()
@@ -663,7 +676,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
                 stage_id=stage_def.stage_id,
                 check_dns=check_dns,
                 max_urls=max_stage_targets,
-                timeout_sec=int(timeouts.get("gau_sec", min(dir_scan_timeout, 120))),
+                timeout_sec=min(int(timeouts.get("gau_sec", min(dir_scan_timeout, 120))), max(1, int(stage_deadline - time.monotonic()))),
                 governor=ctx.resource_governor,
             )
             if gau_hits:
@@ -680,7 +693,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
             stage_id=stage_def.stage_id,
             check_dns=check_dns,
             max_urls=max_stage_targets,
-            timeout_sec=int(timeouts.get("waybackurls_sec", min(dir_scan_timeout, 120))),
+            timeout_sec=min(int(timeouts.get("waybackurls_sec", min(dir_scan_timeout, 120))), max(1, int(stage_deadline - time.monotonic()))),
             governor=ctx.resource_governor,
         )
         if wb_hits:
@@ -695,8 +708,10 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
 
     processed_candidates = 0
     stop_all_hosts = False
+    planned_candidates = max(1, min(max_stage_targets, len(hosts) * len(words)))
+    emit_progress(0, f"Directory discovery starting: {len(hosts)} host(s), {len(words)} word(s)", 0, planned_candidates)
 
-    for host_entry in hosts:
+    for host_index, host_entry in enumerate(hosts, start=1):
         if time.monotonic() >= stage_deadline:
             partial_reasons.append(
                 "Directory stage time budget (timeouts.directory_stage_sec) exhausted; remaining hosts were not scanned"
@@ -738,7 +753,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
                 stage_id=stage_def.stage_id,
                 check_dns=check_dns,
                 max_threads=max_concurrency,
-                timeout_sec=int(timeouts.get("katana_sec", min(dir_scan_timeout, 120))),
+                timeout_sec=min(int(timeouts.get("katana_sec", min(dir_scan_timeout, 120))), max(1, int(stage_deadline - time.monotonic()))),
                 governor=ctx.resource_governor,
             )
             if katana_hits:
@@ -774,7 +789,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
                 stage_id=stage_def.stage_id,
                 check_dns=check_dns,
                 max_threads=max_concurrency,
-                timeout_sec=int(timeouts.get("feroxbuster_sec", dir_scan_timeout)),
+                timeout_sec=min(int(timeouts.get("feroxbuster_sec", dir_scan_timeout)), max(1, int(stage_deadline - time.monotonic()))),
                 governor=ctx.resource_governor,
             )
             if not ferox_err:
@@ -802,7 +817,7 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
                 stage_id=stage_def.stage_id,
                 check_dns=check_dns,
                 max_threads=max_concurrency,
-                timeout_sec=dir_scan_timeout,
+                timeout_sec=min(dir_scan_timeout, max(1, int(stage_deadline - time.monotonic()))),
                 governor=ctx.resource_governor,
             )
             raw_hits.extend(ffuf_hits)
@@ -882,6 +897,12 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
                         "source": "scoped_http_dir_probe",
                     })
 
+        emit_progress(
+            min(95, int(host_index * 95 / max(1, len(hosts)))),
+            f"Directory discovery completed host {host_index}/{len(hosts)}",
+            host_index,
+            len(hosts),
+        )
         if stop_all_hosts:
             break
 
@@ -975,6 +996,12 @@ def run_directory_discovery(ctx: ExecutionContext, stage_def: StageDefinition) -
         and bool(hosts)
         and bool(words)
         and not any("ffuf exited" in reason or "ffuf timed out" in reason for reason in partial_reasons)
+    )
+    emit_progress(
+        100,
+        f"Directory discovery finished: {len(discovered_paths)} in-scope path(s) across {len(hosts)} host(s)",
+        planned_candidates,
+        planned_candidates,
     )
     return StageResult(
         stage_id=stage_def.stage_id,
