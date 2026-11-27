@@ -213,9 +213,11 @@ RUN ln -sf /usr/local/bin/httpx /usr/local/bin/httpx-toolkit && \
 
 WORKDIR /app
 
+RUN mkdir -p /home/scanner && ln -sfn /app/config/nuclei-templates /home/scanner/nuclei-templates && chown -h scanner:scanner /home/scanner/nuclei-templates
 USER scanner
 
 VOLUME ["/app/output", "/app/secrets"]
+
 
 ENTRYPOINT ["quiver"]
 

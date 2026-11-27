@@ -13,7 +13,11 @@ services:
     # Keep the scanner container alive for interactive CLI execution.
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "while :; do sleep 3600; done"
+      - |
+        set -eu
+        [ -L /home/scanner/nuclei-templates ] && rm -f /home/scanner/nuclei-templates || true
+        [ -e /home/scanner/nuclei-templates ] || ln -s /app/config/nuclei-templates /home/scanner/nuclei-templates
+        while :; do sleep 3600; done
 
     depends_on:
       egress-proxy:
@@ -48,6 +52,7 @@ services:
       TERM: "${TERM:-xterm-256color}"
 
     volumes:
+      - ./config/nuclei-templates:/home/scanner/nuclei-templates:ro
       - ./config:/app/config:ro
       - ./output:/app/output
       - ./secrets:/app/secrets

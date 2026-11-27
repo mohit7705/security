@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from security_analyzer.core.nuclei_templates import resolve_nuclei_templates
 from typing import Any
 
 
@@ -44,30 +46,24 @@ def build_environment_snapshot(settings: dict[str, Any], project_root: Path | No
         tools[name] = {"path": path or "", "version": _version([path, *args]) if path else "not-installed"}
 
     config_bytes = json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str).encode()
-    template_paths = (root / "nuclei-templates", root / ".local" / "nuclei-templates")
+    template_candidate = resolve_nuclei_templates(
+        settings.get("nuclei", {}),
+        project_root=root,
+    )
     template_fingerprint = "absent"
     template_root = ""
     template_file_count = 0
     template_fingerprint_complete = True
     max_template_files = 10000
     max_template_bytes = 256 * 1024 * 1024
-    seen_template_roots: set[Path] = set()
-    for candidate in template_paths:
-        if candidate is None:
-            continue
+    if template_candidate is not None:
         try:
-            if not candidate.is_absolute():
-                candidate = root / candidate
-            if candidate.is_symlink():
-                continue
-            candidate = candidate.resolve()
-            if candidate in seen_template_roots or not candidate.is_dir():
-                continue
-            seen_template_roots.add(candidate)
             digest = hashlib.sha256()
             total_bytes = 0
-            for template_file in sorted(candidate.rglob("*")):
+            for template_file in sorted(template_candidate.rglob("*")):
                 if template_file.is_symlink() or not template_file.is_file():
+                    continue
+                if template_file.suffix.lower() not in {".yaml", ".yml"}:
                     continue
                 if template_file_count >= max_template_files:
                     template_fingerprint_complete = False
@@ -76,7 +72,7 @@ def build_environment_snapshot(settings: dict[str, Any], project_root: Path | No
                 if total_bytes + size > max_template_bytes:
                     template_fingerprint_complete = False
                     break
-                relative = template_file.relative_to(candidate).as_posix()
+                relative = template_file.relative_to(template_candidate).as_posix()
                 digest.update(relative.encode("utf-8"))
                 digest.update(b"\\0")
                 with template_file.open("rb") as handle:
@@ -86,13 +82,11 @@ def build_environment_snapshot(settings: dict[str, Any], project_root: Path | No
                 digest.update(b"\\n")
                 template_file_count += 1
             template_fingerprint = digest.hexdigest()
-            template_root = str(candidate)
-            break
+            template_root = str(template_candidate)
         except OSError:
             template_fingerprint = "unreadable"
-            template_root = str(candidate)
+            template_root = str(template_candidate)
             template_fingerprint_complete = False
-            break
 
     return {
         "schema_version": "1.0",

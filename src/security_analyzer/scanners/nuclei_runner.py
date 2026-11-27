@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsp
 from security_analyzer.core.orchestrator import ExecutionContext
 from security_analyzer.core.egress import is_trusted_scope_proxy
 from security_analyzer.core.resource_governor import ResourceLimitExceeded
+from security_analyzer.core.nuclei_templates import resolve_nuclei_templates
 from security_analyzer.core.stage_registry import StageDefinition, StageResult, StageStatus
 from security_analyzer.discovery.inventory_store import UnifiedEndpointInventory
 from security_analyzer.models.finding import Severity
@@ -172,9 +173,16 @@ def run_nuclei_assessment(ctx: ExecutionContext, stage_def: StageDefinition) -> 
     severities = str(nuclei_cfg.get("severities", "low,medium,high,critical"))
     timeout_sec = float(ctx.config.get("timeouts", {}).get("nuclei_sec", 300))
 
-    templates_dir = str(nuclei_cfg.get("templates_dir", "")).strip()
-    if templates_dir and not Path(templates_dir).expanduser().is_dir():
-        reason = "Nuclei skipped: configured templates_dir is not an existing directory"
+    resolved_templates = resolve_nuclei_templates(
+        nuclei_cfg,
+        project_root=ctx.workspace.project_root,
+    )
+    templates_dir = str(resolved_templates) if resolved_templates else ""
+    configured_templates = str(nuclei_cfg.get("templates_dir") or os.environ.get("NUCLEI_TEMPLATES_DIR", "")).strip()
+    if configured_templates and not templates_dir:
+        reason = (
+            "Nuclei skipped: configured templates directory is missing or contains no YAML templates"
+        )
         ctx.coverage.record_skipped_check(stage_def.stage_id, "nuclei_templates", reason)
         return _write_empty_result(ctx, stage_def, reason)
 

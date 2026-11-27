@@ -16,6 +16,7 @@ from security_analyzer.core.coverage_tracker import CoverageTracker
 from security_analyzer.core.dependency_manager import DependencyManager
 from security_analyzer.core.config_validation import validate_settings
 from security_analyzer.core.environment_snapshot import build_environment_snapshot
+from security_analyzer.core.nuclei_templates import resolve_nuclei_templates
 from security_analyzer.core.exceptions import ConfigurationError, SecurityAnalyzerError
 from security_analyzer.core.orchestrator import PipelineOrchestrator
 from security_analyzer.core.scope_engine import ScopeEngine, ScopePolicy
@@ -173,6 +174,8 @@ def _check_preflight_assets(settings: dict[str, Any], profile: str) -> dict[str,
     """Verify wordlist, Chromium/Playwright, and Nuclei templates before scanning."""
     wordlist_raw = str(settings.get("wordlists", {}).get("directories", "")).strip()
     wordlist_path = Path(wordlist_raw).expanduser() if wordlist_raw else None
+    if wordlist_path and not wordlist_path.is_absolute():
+        wordlist_path = (Path.cwd() / wordlist_path).resolve()
     wordlist_words = 0
     if wordlist_path and wordlist_path.is_file():
         try:
@@ -185,23 +188,12 @@ def _check_preflight_assets(settings: dict[str, Any], profile: str) -> dict[str,
             wordlist_words = 0
     wordlist_ok = bool(wordlist_path and wordlist_path.is_file() and wordlist_words > 0)
 
-    configured_tpl = str(settings.get("nuclei", {}).get("templates_dir", "")).strip()
-    template_candidates = (
-        [Path(configured_tpl).expanduser()]
-        if configured_tpl
-        else [
-            Path.home() / "nuclei-templates",
-            Path.home() / ".local" / "nuclei-templates",
-            Path("/root/nuclei-templates"),
-            Path("/usr/share/nuclei-templates"),
-        ]
-    )
-    resolved_tpl_dir = next(
-        (str(p) for p in template_candidates if p.is_dir() and any(p.iterdir())),
-        "",
-    )
     nuclei_binary = shutil.which("nuclei") or ""
-    templates_ok = bool(nuclei_binary and resolved_tpl_dir)
+    resolved_tpl = resolve_nuclei_templates(
+        settings.get("nuclei", {}),
+        project_root=Path.cwd(),
+    )
+    templates_ok = bool(nuclei_binary and resolved_tpl)
 
     playwright_installed = importlib.util.find_spec("playwright") is not None
     chromium_binary = (
@@ -210,17 +202,28 @@ def _check_preflight_assets(settings: dict[str, Any], profile: str) -> dict[str,
         or shutil.which("google-chrome")
         or ""
     )
-    ms_playwright_cache = Path.home() / ".cache" / "ms-playwright"
-    playwright_chromium_cached = (
-        ms_playwright_cache.is_dir()
-        and any(p.name.startswith("chromium") for p in ms_playwright_cache.iterdir())
-    )
+    browser_cache_candidates = []
+    env_browsers = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_browsers:
+        browser_cache_candidates.append(Path(env_browsers).expanduser())
+    browser_cache_candidates.extend([
+        Path("/opt/ms-playwright"),
+        Path.home() / ".cache" / "ms-playwright",
+    ])
+    playwright_chromium_cached = False
+    for cache_dir in browser_cache_candidates:
+        try:
+            if cache_dir.is_dir() and any(p.name.startswith("chromium") for p in cache_dir.iterdir()):
+                playwright_chromium_cached = True
+                break
+        except OSError:
+            continue
     chromium_ok = bool(playwright_installed and (chromium_binary or playwright_chromium_cached))
 
     checks = {
         "wordlist": {
             "ready": wordlist_ok,
-            "path": wordlist_raw,
+            "path": str(wordlist_path) if wordlist_path else wordlist_raw,
             "word_count": wordlist_words,
         },
         "chromium": {
@@ -232,7 +235,12 @@ def _check_preflight_assets(settings: dict[str, Any], profile: str) -> dict[str,
         "nuclei_templates": {
             "ready": templates_ok,
             "nuclei_binary": nuclei_binary,
-            "templates_dir": resolved_tpl_dir,
+            "templates_dir": str(resolved_tpl) if resolved_tpl else "",
+            "install_hint": (
+                "" if templates_ok
+                else "Install/update templates with: nuclei -update-templates "
+                     "(or set nuclei.templates_dir / NUCLEI_TEMPLATES_DIR)"
+            ),
         },
     }
     required_keys = ["wordlist"]
