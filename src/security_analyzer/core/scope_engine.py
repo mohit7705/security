@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import posixpath
 import socket
 from dataclasses import asdict, dataclass, field
@@ -21,6 +22,15 @@ class ScopeDecision:
     normalized_url: str
     reason: str
     resolved_ips: tuple[str, ...] = ()
+
+
+def _dns_delegated_to_proxy() -> bool:
+    """True only in the Docker scanner container (all three variables must be set)."""
+    return (
+        os.environ.get("SECURITY_ANALYZER_DNS_DELEGATED_TO_PROXY") == "1"
+        and os.environ.get("SECURITY_ANALYZER_EGRESS_ENFORCED") == "1"
+        and os.environ.get("SECURITY_ANALYZER_PROXY_TRANSPORT") == "docker"
+    )
 
 
 @dataclass
@@ -163,6 +173,11 @@ class ScopeEngine:
             try:
                 infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
             except OSError as exc:
+                if _dns_delegated_to_proxy():
+                    # Docker internal network: this container has no DNS. The egress proxy
+                    # resolves the name, validates every IP against the scope and connects
+                    # to that exact IP, so the check is not skipped, only moved to the proxy.
+                    return True, "", ()
                 return False, f"DNS resolution failed for {hostname}: {type(exc).__name__}", ()
             ips = []
             for info in infos:

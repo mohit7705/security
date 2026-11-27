@@ -28,6 +28,8 @@ services:
       SECURITY_ANALYZER_PROXY: "http://egress-proxy:3128"
       SECURITY_ANALYZER_PROXY_TRANSPORT: "docker"
       SECURITY_ANALYZER_EGRESS_ENFORCED: "1"
+      # This container is on an internal network with no DNS; the egress proxy resolves and validates names.
+      SECURITY_ANALYZER_DNS_DELEGATED_TO_PROXY: "1"
 
       HTTP_PROXY: "http://egress-proxy:3128"
       HTTPS_PROXY: "http://egress-proxy:3128"
